@@ -1,0 +1,5 @@
+# Rust stable at the time the project was set up; see docs/DECISIONS.md.
+[toolchain]
+channel = "1.99.1"
+profile = "minimal"
+components = ["clippy", "rustfmt"]

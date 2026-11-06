@@ -1,0 +1,2 @@
+XSS-NATIVE-SYNTHETIC-CONTENT
+Synthetic document for dss-native tests. Contains no personal data.

@@ -1,0 +1,389 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  dss-native: EU DSS validation engine packaged as a GraalVM Native Image shared library.
+  SPDX-FileCopyrightText: 2026 Coding Duck
+  SPDX-License-Identifier: LGPL-2.1-or-later
+-->
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <groupId>it.codingduck.dssnative</groupId>
+    <artifactId>dss-native</artifactId>
+    <version>0.0.0-dev</version>
+    <packaging>jar</packaging>
+
+    <name>dss-native</name>
+    <description>Thin wrapper around EU DSS, compiled to a shared library with GraalVM Native Image.</description>
+    <url>https://github.com/codingduck/dss-native</url>
+    <inceptionYear>2026</inceptionYear>
+    <organization>
+        <name>Coding Duck</name>
+    </organization>
+
+    <licenses>
+        <license>
+            <name>LGPL-2.1-or-later</name>
+            <url>https://www.gnu.org/licenses/old-licenses/lgpl-2.1.html</url>
+            <distribution>repo</distribution>
+        </license>
+    </licenses>
+
+    <scm>
+        <url>https://github.com/codingduck/dss-native</url>
+        <connection>scm:git:https://github.com/codingduck/dss-native.git</connection>
+    </scm>
+
+    <properties>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <maven.compiler.release>21</maven.compiler.release>
+
+        <!-- See docs/DECISIONS.md for why each version was chosen. -->
+        <dss.version>6.5.1</dss.version>
+        <slf4j.version>2.0.20</slf4j.version>
+        <junit.version>6.1.3</junit.version>
+        <!-- Must match the GraalVM CE release used to build (graal 25.4.4.1.1). -->
+        <graalvm.sdk.version>25.4.4.1.1</graalvm.sdk.version>
+        <native-maven-plugin.version>1.1.17</native-maven-plugin.version>
+        <!-- Throw (default) | Warn | Exit: how a native image reports missing reachability metadata. -->
+        <native.missingRegistrationMode>Throw</native.missingRegistrationMode>
+        <!-- Set per OS by the native-os-* profiles: install name / soname of the shared library, and the oldest
+             macOS it loads on. The defaults are placeholders, because a buildArg cannot be empty. -->
+        <native.libLinkerOption>-H:+ReportExceptionStackTraces</native.libLinkerOption>
+        <native.libMinOsOption>-H:+ReportExceptionStackTraces</native.libMinOsOption>
+        <!-- Oldest macOS the library loads on: the deployment target of GraalVM CE's own C libraries
+             (lib/svm/clibraries), linked into the image. -->
+        <native.macosMinVersion>14.0</native.macosMinVersion>
+
+        <maven-compiler-plugin.version>3.16.0</maven-compiler-plugin.version>
+        <maven-surefire-plugin.version>3.6.1</maven-surefire-plugin.version>
+        <maven-resources-plugin.version>3.5.0</maven-resources-plugin.version>
+        <maven-jar-plugin.version>3.5.1</maven-jar-plugin.version>
+        <maven-clean-plugin.version>3.5.0</maven-clean-plugin.version>
+        <maven-install-plugin.version>3.2.0</maven-install-plugin.version>
+        <maven-dependency-plugin.version>3.11.0</maven-dependency-plugin.version>
+        <maven-enforcer-plugin.version>3.6.3</maven-enforcer-plugin.version>
+        <exec-maven-plugin.version>3.6.4</exec-maven-plugin.version>
+
+        <!-- Repo-relative paths used by tests. -->
+        <dssnative.repoRoot>${project.basedir}/..</dssnative.repoRoot>
+    </properties>
+
+    <dependencyManagement>
+        <dependencies>
+            <!-- junit-bom first: dss-bom also manages JUnit (5.x) and the first import wins. -->
+            <dependency>
+                <groupId>org.junit</groupId>
+                <artifactId>junit-bom</artifactId>
+                <version>${junit.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+            <dependency>
+                <groupId>eu.europa.ec.joinup.sd-dss</groupId>
+                <artifactId>dss-bom</artifactId>
+                <version>${dss.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>
+
+    <dependencies>
+        <!-- Validation core. Optional in dss-cades/dss-pades since DSS 6, so declared explicitly. -->
+        <dependency>
+            <groupId>eu.europa.ec.joinup.sd-dss</groupId>
+            <artifactId>dss-validation</artifactId>
+        </dependency>
+        <!-- Default validation policy (policy/constraint.xml) and cryptographic suite. -->
+        <dependency>
+            <groupId>eu.europa.ec.joinup.sd-dss</groupId>
+            <artifactId>dss-policy-jaxb</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>eu.europa.ec.joinup.sd-dss</groupId>
+            <artifactId>dss-policy-crypto-xml</artifactId>
+        </dependency>
+
+        <!-- Signature formats -->
+        <dependency>
+            <groupId>eu.europa.ec.joinup.sd-dss</groupId>
+            <artifactId>dss-cades</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>eu.europa.ec.joinup.sd-dss</groupId>
+            <artifactId>dss-pades</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>eu.europa.ec.joinup.sd-dss</groupId>
+            <artifactId>dss-pades-pdfbox</artifactId>
+        </dependency>
+
+        <!-- Trusted lists -->
+        <dependency>
+            <groupId>eu.europa.ec.joinup.sd-dss</groupId>
+            <artifactId>dss-tsl-validation</artifactId>
+        </dependency>
+
+        <!-- HTTP data loaders, online CRL/OCSP sources -->
+        <dependency>
+            <groupId>eu.europa.ec.joinup.sd-dss</groupId>
+            <artifactId>dss-service</artifactId>
+        </dependency>
+
+        <!-- Implementations DSS picks via ServiceLoader -->
+        <dependency>
+            <groupId>eu.europa.ec.joinup.sd-dss</groupId>
+            <artifactId>dss-utils-apache-commons</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>eu.europa.ec.joinup.sd-dss</groupId>
+            <artifactId>dss-crl-parser-stream</artifactId>
+        </dependency>
+        <!-- In-memory CMS (BouncyCastle CMSSignedData). dss-cms-stream is marked experimental in 6.5.1. -->
+        <dependency>
+            <groupId>eu.europa.ec.joinup.sd-dss</groupId>
+            <artifactId>dss-cms-object</artifactId>
+        </dependency>
+
+        <!-- Logging: DSS logs through SLF4J; simple stderr backend, level set by config. -->
+        <dependency>
+            <groupId>org.slf4j</groupId>
+            <artifactId>slf4j-simple</artifactId>
+            <version>${slf4j.version}</version>
+        </dependency>
+
+        <!-- GraalVM APIs (Feature, later @CEntryPoint). Provided by native-image at build time. -->
+        <dependency>
+            <groupId>org.graalvm.sdk</groupId>
+            <artifactId>nativeimage</artifactId>
+            <version>${graalvm.sdk.version}</version>
+            <scope>provided</scope>
+        </dependency>
+
+        <!-- Tests -->
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.junit.platform</groupId>
+            <artifactId>junit-platform-launcher</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <resources>
+            <resource>
+                <directory>src/main/resources</directory>
+            </resource>
+            <!-- version.properties: library and DSS versions, reported by dss_version. -->
+            <resource>
+                <directory>src/main/resources-filtered</directory>
+                <filtering>true</filtering>
+            </resource>
+        </resources>
+        <pluginManagement>
+            <plugins>
+                <plugin>
+                    <artifactId>maven-clean-plugin</artifactId>
+                    <version>${maven-clean-plugin.version}</version>
+                </plugin>
+                <plugin>
+                    <artifactId>maven-resources-plugin</artifactId>
+                    <version>${maven-resources-plugin.version}</version>
+                </plugin>
+                <plugin>
+                    <artifactId>maven-jar-plugin</artifactId>
+                    <version>${maven-jar-plugin.version}</version>
+                </plugin>
+                <plugin>
+                    <artifactId>maven-install-plugin</artifactId>
+                    <version>${maven-install-plugin.version}</version>
+                </plugin>
+                <plugin>
+                    <artifactId>maven-dependency-plugin</artifactId>
+                    <version>${maven-dependency-plugin.version}</version>
+                </plugin>
+                <plugin>
+                    <groupId>org.codehaus.mojo</groupId>
+                    <artifactId>exec-maven-plugin</artifactId>
+                    <version>${exec-maven-plugin.version}</version>
+                </plugin>
+            </plugins>
+        </pluginManagement>
+
+        <plugins>
+            <plugin>
+                <artifactId>maven-enforcer-plugin</artifactId>
+                <version>${maven-enforcer-plugin.version}</version>
+                <executions>
+                    <execution>
+                        <id>enforce</id>
+                        <goals>
+                            <goal>enforce</goal>
+                        </goals>
+                        <configuration>
+                            <rules>
+                                <requireMavenVersion>
+                                    <version>[3.9,)</version>
+                                </requireMavenVersion>
+                                <requireJavaVersion>
+                                    <version>[21,)</version>
+                                </requireJavaVersion>
+                            </rules>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+            <plugin>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <version>${maven-compiler-plugin.version}</version>
+                <configuration>
+                    <compilerArgs>
+                        <arg>-Xlint:all,-serial,-processing</arg>
+                    </compilerArgs>
+                </configuration>
+            </plugin>
+            <plugin>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <version>${maven-surefire-plugin.version}</version>
+                <configuration>
+                    <!-- Online trusted-list tests need the network; run them with -Pintegration. -->
+                    <excludedGroups>online</excludedGroups>
+                    <systemPropertyVariables>
+                        <dssnative.repoRoot>${dssnative.repoRoot}</dssnative.repoRoot>
+                        <org.slf4j.simpleLogger.defaultLogLevel>warn</org.slf4j.simpleLogger.defaultLogLevel>
+                    </systemPropertyVariables>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
+
+    <profiles>
+        <profile>
+            <!--
+              Native build: `./mvnw -Pnative test` runs the JUnit suite on the JVM, then compiles it with
+              native-image (exact reachability metadata) and runs it again as a native executable.
+            -->
+            <id>native</id>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.graalvm.buildtools</groupId>
+                        <artifactId>native-maven-plugin</artifactId>
+                        <version>${native-maven-plugin.version}</version>
+                        <extensions>true</extensions>
+                        <executions>
+                            <execution>
+                                <id>test-native</id>
+                                <goals>
+                                    <goal>test</goal>
+                                </goals>
+                                <phase>test</phase>
+                            </execution>
+                            <execution>
+                                <!-- The deliverable: libdssnative.{so,dylib} + dssnative.h + graal_isolate.h -->
+                                <id>build-shared-library</id>
+                                <goals>
+                                    <goal>compile-no-fork</goal>
+                                </goals>
+                                <phase>package</phase>
+                                <configuration>
+                                    <sharedLibrary>true</sharedLibrary>
+                                    <!-- native-image adds no "lib" prefix itself: libdssnative.so / .dylib / .h -->
+                                    <imageName>libdssnative</imageName>
+                                    <buildArgs combine.children="append">
+                                        <!-- Portable machine code: x86-64-v1 / armv8-a, not the newer default ISA. -->
+                                        <buildArg>-march=compatibility</buildArg>
+                                        <buildArg>${native.libLinkerOption}</buildArg>
+                                        <buildArg>${native.libMinOsOption}</buildArg>
+                                    </buildArgs>
+                                </configuration>
+                            </execution>
+                        </executions>
+                        <configuration>
+                            <!-- oracle/graalvm-reachability-metadata as bundled with NBT 1.1.17 (release 1.0.20). -->
+                            <metadataRepository>
+                                <enabled>true</enabled>
+                            </metadataRepository>
+                            <buildArgs>
+                                <buildArg>--exact-reachability-metadata</buildArg>
+                                <buildArg>-H:+UnlockExperimentalVMOptions</buildArg>
+                                <buildArg>-H:MissingRegistrationReportingMode=${native.missingRegistrationMode}</buildArg>
+                                <buildArg>-H:-UnlockExperimentalVMOptions</buildArg>
+                                <buildArg>-H:+ReportExceptionStackTraces</buildArg>
+                            </buildArgs>
+                        </configuration>
+                    </plugin>
+                    <plugin>
+                        <!-- The LICENSE and NOTICE files of every third-party jar compiled into the library, one
+                             folder per jar. scripts/build-native.sh ships them as licenses/java/ (LICENSING.md).
+                             DSS's jars carry none: its notice is third-party/dss.txt. -->
+                        <artifactId>maven-dependency-plugin</artifactId>
+                        <executions>
+                            <execution>
+                                <id>third-party-licenses</id>
+                                <goals>
+                                    <goal>unpack-dependencies</goal>
+                                </goals>
+                                <phase>package</phase>
+                                <configuration>
+                                    <includeScope>runtime</includeScope>
+                                    <excludeGroupIds>eu.europa.ec.joinup.sd-dss</excludeGroupIds>
+                                    <includes>META-INF/LICENSE*,META-INF/NOTICE*</includes>
+                                    <useSubDirectoryPerArtifact>true</useSubDirectoryPerArtifact>
+                                    <stripType>true</stripType>
+                                    <outputDirectory>${project.build.directory}/third-party-licenses</outputDirectory>
+                                </configuration>
+                            </execution>
+                        </executions>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+        <profile>
+            <!-- Relocatable install name, so applications can find the library through their rpath; minimum macOS. -->
+            <id>native-os-mac</id>
+            <activation>
+                <os>
+                    <family>mac</family>
+                </os>
+            </activation>
+            <properties>
+                <native.libLinkerOption>-H:NativeLinkerOption=-Wl,-install_name,@rpath/libdssnative.dylib</native.libLinkerOption>
+                <!-- Without it the linker records the build machine's macOS version as the minimum. -->
+                <native.libMinOsOption>-H:NativeLinkerOption=-mmacosx-version-min=${native.macosMinVersion}</native.libMinOsOption>
+            </properties>
+        </profile>
+        <profile>
+            <id>native-os-linux</id>
+            <activation>
+                <os>
+                    <name>Linux</name>
+                </os>
+            </activation>
+            <properties>
+                <native.libLinkerOption>-H:NativeLinkerOption=-Wl,-soname,libdssnative.so</native.libLinkerOption>
+            </properties>
+        </profile>
+        <profile>
+            <!-- Online LOTL/TL tests. Not part of the default build: they need internet access. -->
+            <id>integration</id>
+            <build>
+                <plugins>
+                    <plugin>
+                        <artifactId>maven-surefire-plugin</artifactId>
+                        <configuration>
+                            <groups>online</groups>
+                            <excludedGroups combine.self="override"/>
+                        </configuration>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+    </profiles>
+</project>

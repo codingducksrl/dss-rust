@@ -1,0 +1,14 @@
+[package]
+name = "dss-sys"
+description = "Raw FFI bindings to libdssnative (EU DSS compiled with GraalVM Native Image)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+# Lets dependents read the library directory as DEP_DSSNATIVE_LIB_DIR in their build scripts.
+links = "dssnative"
+
+[build-dependencies]
+bindgen.workspace = true

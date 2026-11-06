@@ -1,0 +1,33 @@
+[package]
+name = "dss-server"
+description = "HTTP sidecar for the dss crate: validate, extend and sign from applications in other languages"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# The tests are all in tests/, whose binaries get the development rpath (build.rs).
+[lib]
+test = false
+doctest = false
+
+[[bin]]
+name = "dss-server"
+path = "src/main.rs"
+test = false
+
+[dependencies]
+axum.workspace = true
+base64.workspace = true
+clap.workspace = true
+dss = { workspace = true, features = ["tokio"] }
+# Direct dependency only for its build metadata (DEP_DSSNATIVE_LIB_DIR), used for the dev rpath.
+dss-sys.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "signal", "macros", "sync"] }
+
+[dev-dependencies]
+http-body-util.workspace = true
+tower = { workspace = true, features = ["util"] }

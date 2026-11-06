@@ -1,0 +1,20 @@
+# Build outputs
+java/target/
+rust/target/
+/build/
+
+# Real signed documents may contain personal data: never commit them.
+testdata/private/*
+!testdata/private/README.md
+
+# Local trusted-list caches (a seed snapshot is produced by CI, not committed)
+/tl-cache/
+
+# IDE / OS
+.idea/
+*.iml
+.vscode/
+.DS_Store
+
+# Packages from scripts/package.sh
+/dist/

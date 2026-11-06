@@ -1,0 +1,24 @@
+[package]
+name = "dss"
+description = "Safe Rust API to the EU DSS signature validation engine (libdssnative, no JVM required)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[features]
+# RefreshScheduler: periodic trusted-list refresh on a tokio runtime. The core API is runtime-agnostic.
+tokio = ["dep:tokio"]
+
+[dependencies]
+base64.workspace = true
+dss-sys.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, optional = true, features = ["rt", "time", "sync", "macros"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "time", "sync", "macros"] }

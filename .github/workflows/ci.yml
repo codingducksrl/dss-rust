@@ -1,0 +1,212 @@
+# SPDX-FileCopyrightText: 2026 Coding Duck
+# SPDX-License-Identifier: LGPL-2.1-or-later
+#
+# dss-native CI. See docs/DECISIONS.md, "Phase 6".
+#
+# Runs only when a GitHub release is published, or when started by hand. Pushes and pull requests run nothing:
+# a full run takes about 25 minutes per platform, and private repositories pay for minutes beyond the plan's
+# allowance, macOS counting 10x.
+#
+#   release published   linux-x64, linux-aarch64, macos-aarch64: JVM + native + C + Rust + differential tests,
+#                       package; online suites against the real EU LOTL and the seed trusted-list cache; then
+#                       the packages, the seed cache and the OJ keystore are uploaded to that release
+#   manual run          the same builds and tests, uploading nothing; online=true adds the online suites
+#
+# The release tag is the version (v1.2.3 -> 1.2.3): the building jobs stamp it into java/pom.xml and
+# rust/Cargo.toml (scripts/ci/set-version.sh). Manual runs keep the committed 0.0.0-dev placeholder.
+#
+# Actions are pinned to commit SHAs.
+name: CI
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      online:
+        description: Also run the online trusted-list suites and build a seed cache snapshot
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+
+jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: github.event_name == 'release'
+
+      # Validated here, in seconds, rather than after the builds.
+      - id: version
+        name: Version from the release tag
+        if: github.event_name == 'release'
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          if [[ "$TAG" != v* ]]; then
+            echo "::error::Release tag $TAG must be v<version>, like v1.2.0 or v1.2.0-rc.1"
+            exit 1
+          fi
+          scripts/ci/set-version.sh "${TAG#v}"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: ${{ matrix.platform }}
+    needs: plan
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { platform: linux-x64, runner: ubuntu-24.04 }
+          - { platform: linux-aarch64, runner: ubuntu-24.04-arm }
+          - { platform: macos-aarch64, runner: macos-15 }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: ./.github/actions/setup
+        with:
+          platform: ${{ matrix.platform }}
+
+      # After setup, whose Maven cache key hashes the committed java/pom.xml.
+      - name: Version from the release tag
+        if: needs.plan.outputs.version != ''
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: scripts/ci/set-version.sh "$VERSION"
+
+      - name: JVM tests, native tests (exact reachability metadata), shared library
+        run: scripts/build-native.sh --with-tests
+
+      - name: Native tests again, any missing registration fatal
+        run: scripts/run-native-tests.sh -XX:MissingRegistrationReportingMode=Exit
+
+      - name: C smoke test
+        run: scripts/smoke-test-c.sh
+
+      - name: Rust format and lints
+        working-directory: rust
+        run: |
+          cargo fmt --all --check
+          cargo clippy --workspace --all-features --all-targets -- -D warnings
+
+      - name: Rust tests against the native library
+        run: scripts/test-rust.sh
+
+      - name: Differential test (plain DSS on the JVM vs Rust -> native)
+        run: scripts/diff-vs-jvm.sh
+
+      - name: Package
+        run: scripts/package.sh
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dss-native-${{ matrix.platform }}
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error
+
+      - name: Test reports
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: reports-${{ matrix.platform }}
+          path: |
+            build/diff/*.md
+            build/diff/*.log
+            java/target/surefire-reports/
+            java/target/native-test-reports/
+          if-no-files-found: ignore
+
+  online:
+    name: online (real EU LOTL) + seed cache
+    if: >-
+      (github.event_name == 'workflow_dispatch' && inputs.online) ||
+      github.event_name == 'release'
+    needs: plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: ./.github/actions/setup
+        with:
+          platform: linux-x64
+
+      # After setup, whose Maven cache key hashes the committed java/pom.xml.
+      - name: Version from the release tag
+        if: needs.plan.outputs.version != ''
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: scripts/ci/set-version.sh "$VERSION"
+
+      - name: Shared library
+        run: scripts/build-native.sh
+
+      - name: JVM online suite
+        working-directory: java
+        run: ./mvnw -B test -Pintegration
+
+      - name: C smoke test, online (verified TLS, trust-store override)
+        run: scripts/smoke-test-c.sh --online
+
+      - name: Rust tests, online (refresh while validating)
+        run: scripts/test-rust.sh --online
+
+      - name: Seed trusted-list cache snapshot (full EU LOTL)
+        run: |
+          (cd rust && cargo build -q --release -p dss-cli)
+          cli=rust/target/release/dss-cli
+          stamp="$(date -u +%Y%m%d)"
+          rm -rf build/tl-seed && mkdir -p dist
+          "$cli" --oj-keystore trust/oj-keystore.p12 --cache-dir build/tl-seed tl refresh
+          "$cli" --oj-keystore trust/oj-keystore.p12 --cache-dir build/tl-seed tl status --json \
+            > "dist/dss-native-tl-cache-$stamp.status.json"
+          tar -czf "dist/dss-native-tl-cache-$stamp.tar.gz" -C build/tl-seed tl
+          (cd dist && sha256sum dss-native-tl-cache-*.tar.gz > "dss-native-tl-cache-$stamp.tar.gz.sha256")
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: tl-cache-snapshot
+          path: dist/dss-native-tl-cache-*
+          if-no-files-found: error
+
+  release-assets:
+    name: upload to the GitHub release
+    if: github.event_name == 'release'
+    needs: [build, online]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Only the deliverables: not the reports-* artifacts.
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: dss-native-*
+          path: release
+          merge-multiple: true
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: tl-cache-snapshot
+          path: release
+
+      # --clobber: a re-run replaces the assets it uploaded before.
+      - name: Upload to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          cp trust/oj-keystore.p12 release/
+          gh release upload "$TAG" release/* --clobber

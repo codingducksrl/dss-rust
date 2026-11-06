@@ -1,0 +1,1067 @@
+{
+  "reflection": [
+    {
+      "type": "it.codingduck.dssnative.diff.OutcomeTest",
+      "methods": [
+        {
+          "name": "<init>",
+          "parameterTypes": []
+        },
+        {
+          "name": "equalOutcomesHaveNoDifferences",
+          "parameterTypes": []
+        },
+        {
+          "name": "everyComparedFieldIsDetected",
+          "parameterTypes": []
+        },
+        {
+          "name": "structureDifferencesAreDetected",
+          "parameterTypes": []
+        }
+      ]
+    },
+    {
+      "type": "it.codingduck.dssnative.diff.PlainDssParityTest",
+      "methods": [
+        {
+          "name": "<init>",
+          "parameterTypes": []
+        },
+        {
+          "name": "detachedContents",
+          "parameterTypes": []
+        },
+        {
+          "name": "detachedSignatureMatchesPlainDss",
+          "parameterTypes": [
+            "java.lang.String"
+          ]
+        },
+        {
+          "name": "engineMatchesPlainDss",
+          "parameterTypes": [
+            "java.lang.String"
+          ]
+        },
+        {
+          "name": "fixtures",
+          "parameterTypes": []
+        },
+        {
+          "name": "setUp",
+          "parameterTypes": [
+            "java.nio.file.Path"
+          ]
+        },
+        {
+          "name": "tearDown",
+          "parameterTypes": []
+        }
+      ]
+    },
+    {
+      "type": "it.codingduck.dssnative.engine.ConcurrentRefreshTest",
+      "fields": [
+        {
+          "name": "tmp"
+        }
+      ],
+      "methods": [
+        {
+          "name": "<init>",
+          "parameterTypes": []
+        },
+        {
+          "name": "validationsDuringRefreshesKeepTheirVerdicts",
+          "parameterTypes": []
+        }
+      ]
+    },
+    {
+      "type": "it.codingduck.dssnative.engine.DssJsonApiTest",
+      "fields": [
+        {
+          "name": "tmp"
+        }
+      ],
+      "methods": [
+        {
+          "name": "<init>",
+          "parameterTypes": []
+        },
+        {
+          "name": "badInputsBecomeStructuredErrors",
+          "parameterTypes": []
+        },
+        {
+          "name": "callsBeforeInitReportNotInitialized",
+          "parameterTypes": []
+        },
+        {
+          "name": "corruptDocumentsNeverThrow",
+          "parameterTypes": []
+        },
+        {
+          "name": "initOnEmptyCacheSucceedsButValidationRefuses",
+          "parameterTypes": []
+        },
+        {
+          "name": "invalidConfigurationIsRejected",
+          "parameterTypes": []
+        },
+        {
+          "name": "offlineRevocationLeavesBaselineBIndeterminate",
+          "parameterTypes": []
+        },
+        {
+          "name": "reInitReplacesTheEngine",
+          "parameterTypes": []
+        },
+        {
+          "name": "setUp",
+          "parameterTypes": []
+        },
+        {
+          "name": "tearDown",
+          "parameterTypes": []
+        },
+        {
+          "name": "validateReturnsSummaryAndRequestedReports",
+          "parameterTypes": []
+        },
+        {
+          "name": "versionNeedsNoInit",
+          "parameterTypes": []
+        },
+        {
+          "name": "bufferInputBehavesLikeByteArrayInput",
+          "parameterTypes": []
+        },
+        {
+          "name": "extendHandsBackTheDocumentOnlyOnSuccess",
+          "parameterTypes": []
+        },
+        {
+          "name": "signingHandsBackTheDocumentOnlyOnSuccess",
+          "parameterTypes": []
+        },
+        {
+          "name": "tlSnapshotExportsAndStartsAnEngine",
+          "parameterTypes": []
+        }
+      ]
+    },
+    {
+      "type": "it.codingduck.dssnative.engine.ExtensionTest",
+      "methods": [
+        {
+          "name": "<init>",
+          "parameterTypes": []
+        },
+        {
+          "name": "aLowerTargetThanTheSignatureIsRefused",
+          "parameterTypes": []
+        },
+        {
+          "name": "aNeededTimestampWithoutTsaIsReported",
+          "parameterTypes": []
+        },
+        {
+          "name": "aTamperedSignatureIsRefused",
+          "parameterTypes": []
+        },
+        {
+          "name": "anUnsignedPdfIsRefused",
+          "parameterTypes": []
+        },
+        {
+          "name": "bToLtaGoesThroughEveryLevel",
+          "parameterTypes": []
+        },
+        {
+          "name": "bToTAddsADocumentTimestamp",
+          "parameterTypes": []
+        },
+        {
+          "name": "base64InputIsDecoded",
+          "parameterTypes": []
+        },
+        {
+          "name": "ltToLtAgainStaysValid",
+          "parameterTypes": []
+        },
+        {
+          "name": "ltToLtaAddsAnArchiveTimestamp",
+          "parameterTypes": []
+        },
+        {
+          "name": "ltaCanBeExtendedAgain",
+          "parameterTypes": []
+        },
+        {
+          "name": "missingRevocationDataIsRefused",
+          "parameterTypes": []
+        },
+        {
+          "name": "onlyPdfsAreExtended",
+          "parameterTypes": []
+        },
+        {
+          "name": "optionsAreParsed",
+          "parameterTypes": []
+        },
+        {
+          "name": "setUp",
+          "parameterTypes": [
+            "java.nio.file.Path"
+          ]
+        },
+        {
+          "name": "tToLtEmbedsTheRevocationData",
+          "parameterTypes": []
+        },
+        {
+          "name": "tToTAddsAnotherDocumentTimestamp",
+          "parameterTypes": []
+        },
+        {
+          "name": "tearDown",
+          "parameterTypes": []
+        },
+        {
+          "name": "tsaConfigIsChecked",
+          "parameterTypes": []
+        }
+      ]
+    },
+    {
+      "type": "it.codingduck.dssnative.engine.FixtureValidationTest",
+      "methods": [
+        {
+          "name": "<init>",
+          "parameterTypes": []
+        },
+        {
+          "name": "detachedSignatureWithItsContentPasses",
+          "parameterTypes": []
+        },
+        {
+          "name": "detachedSignatureWithTamperedContentFails",
+          "parameterTypes": []
+        },
+        {
+          "name": "fixtureHasExpectedVerdict",
+          "parameterTypes": [
+            "java.lang.String",
+            "java.lang.String",
+            "java.util.List",
+            "java.util.List",
+            "java.lang.String"
+          ]
+        },
+        {
+          "name": "fixtures",
+          "parameterTypes": []
+        },
+        {
+          "name": "nestedP7mIsValidatedAtEveryLevel",
+          "parameterTypes": []
+        },
+        {
+          "name": "nestedUnwrappingCanBeDisabled",
+          "parameterTypes": []
+        },
+        {
+          "name": "requestedReportsAreReturned",
+          "parameterTypes": []
+        },
+        {
+          "name": "setUp",
+          "parameterTypes": [
+            "java.nio.file.Path"
+          ]
+        },
+        {
+          "name": "tamperedNestedP7mFailsAtEveryLevel",
+          "parameterTypes": []
+        },
+        {
+          "name": "tearDown",
+          "parameterTypes": []
+        }
+      ]
+    },
+    {
+      "type": "it.codingduck.dssnative.engine.HttpsLoopbackTest",
+      "fields": [
+        {
+          "name": "tmp"
+        }
+      ],
+      "methods": [
+        {
+          "name": "<init>",
+          "parameterTypes": []
+        },
+        {
+          "name": "builtInCaBundleRejectsAnUnknownServerCa",
+          "parameterTypes": []
+        },
+        {
+          "name": "startServer",
+          "parameterTypes": []
+        },
+        {
+          "name": "stopServer",
+          "parameterTypes": []
+        },
+        {
+          "name": "trustedListDownloadsSkipTlsVerificationByDefault",
+          "parameterTypes": []
+        },
+        {
+          "name": "verifiedTlsWithTrustStoreOverrideLoadsTheLists",
+          "parameterTypes": []
+        },
+        {
+          "name": "extensionToLtaUsesAnAuthenticatedHttpsTsa",
+          "parameterTypes": []
+        }
+      ]
+    },
+    {
+      "type": "it.codingduck.dssnative.engine.InputNormalizerTest",
+      "methods": [
+        {
+          "name": "<init>",
+          "parameterTypes": []
+        },
+        {
+          "name": "decodesBase64Variants",
+          "parameterTypes": []
+        },
+        {
+          "name": "decodesPemArmour",
+          "parameterTypes": []
+        },
+        {
+          "name": "doubleBase64IsUnwrappedTwice",
+          "parameterTypes": []
+        },
+        {
+          "name": "recognisesRawFormats",
+          "parameterTypes": []
+        },
+        {
+          "name": "unknownInputIsReportedAsSuch",
+          "parameterTypes": []
+        }
+      ]
+    },
+    {
+      "type": "it.codingduck.dssnative.engine.JsonTest",
+      "methods": [
+        {
+          "name": "<init>",
+          "parameterTypes": []
+        },
+        {
+          "name": "blankObjectInputIsEmptyObject",
+          "parameterTypes": []
+        },
+        {
+          "name": "parsesAllValueKinds",
+          "parameterTypes": []
+        },
+        {
+          "name": "rejectsExcessiveNesting",
+          "parameterTypes": []
+        },
+        {
+          "name": "rejectsMalformedInput",
+          "parameterTypes": []
+        },
+        {
+          "name": "writesAndRoundTrips",
+          "parameterTypes": []
+        }
+      ]
+    },
+    {
+      "type": "it.codingduck.dssnative.engine.OnlineTrustedListTest"
+    },
+    {
+      "type": "it.codingduck.dssnative.engine.SigningTest",
+      "methods": [
+        {
+          "name": "<init>",
+          "parameterTypes": []
+        },
+        {
+          "name": "aCmsForAnotherPreparationIsRefused",
+          "parameterTypes": []
+        },
+        {
+          "name": "aCmsFromAnotherSignerIsRefusedWhenTheCertificateIsGiven",
+          "parameterTypes": []
+        },
+        {
+          "name": "aCmsLargerThanTheReservedSpaceIsRefused",
+          "parameterTypes": []
+        },
+        {
+          "name": "aSignatureValueForAnotherPreparationIsRefused",
+          "parameterTypes": []
+        },
+        {
+          "name": "aSigningTimeOutsideTheCertificateIsRefusedAtPrepare",
+          "parameterTypes": []
+        },
+        {
+          "name": "base64ExternalSignaturesAreDecoded",
+          "parameterTypes": []
+        },
+        {
+          "name": "cadesFromACmsDetachedAndEnveloping",
+          "parameterTypes": []
+        },
+        {
+          "name": "cadesFromACmsExtendsToLtAndLta",
+          "parameterTypes": []
+        },
+        {
+          "name": "cadesFromASignatureValue",
+          "parameterTypes": []
+        },
+        {
+          "name": "cmsThatIsNotBaselineIsRefused",
+          "parameterTypes": []
+        },
+        {
+          "name": "completeNeedsTheSigningTime",
+          "parameterTypes": []
+        },
+        {
+          "name": "ecdsaSignatureValuesAsDerOrPlain",
+          "parameterTypes": []
+        },
+        {
+          "name": "onlyLtAndLtaNeedTheTrustedLists",
+          "parameterTypes": []
+        },
+        {
+          "name": "optionsAreParsed",
+          "parameterTypes": []
+        },
+        {
+          "name": "padesDictionaryEntriesAndDigestAlgorithm",
+          "parameterTypes": []
+        },
+        {
+          "name": "padesFromACmsWithoutTimestamp",
+          "parameterTypes": []
+        },
+        {
+          "name": "padesFromASignatureValueAtEveryLevel",
+          "parameterTypes": []
+        },
+        {
+          "name": "padesFromATimestampedCmsAtLevelBIsT",
+          "parameterTypes": []
+        },
+        {
+          "name": "padesFromATimestampedCmsExtendsToLt",
+          "parameterTypes": []
+        },
+        {
+          "name": "preparingIsRepeatable",
+          "parameterTypes": []
+        },
+        {
+          "name": "setUp",
+          "parameterTypes": [
+            "java.nio.file.Path"
+          ]
+        },
+        {
+          "name": "tearDown",
+          "parameterTypes": []
+        },
+        {
+          "name": "timestampsNeedATsa",
+          "parameterTypes": []
+        },
+        {
+          "name": "unsuitableDocumentsAreRefused",
+          "parameterTypes": []
+        },
+        {
+          "name": "preparingDoesNotDependOnTheHostTimeZone",
+          "parameterTypes": []
+        }
+      ]
+    },
+    {
+      "type": "it.codingduck.dssnative.engine.TlSnapshotFile$CertificateDer",
+      "serializable": true
+    },
+    {
+      "type": "it.codingduck.dssnative.engine.TlSnapshotTest",
+      "fields": [
+        {
+          "name": "tmp"
+        }
+      ],
+      "methods": [
+        {
+          "name": "<init>",
+          "parameterTypes": []
+        },
+        {
+          "name": "exportNeedsLoadedLists",
+          "parameterTypes": []
+        },
+        {
+          "name": "listsThatExpiredSinceTheExportAreRejectedWhenExpiredListsAreRefused",
+          "parameterTypes": []
+        },
+        {
+          "name": "onlineRefreshAfterASnapshotReplacesItsLists",
+          "parameterTypes": []
+        },
+        {
+          "name": "otherDssVersionOrTrustedListSettingsAreRejected",
+          "parameterTypes": []
+        },
+        {
+          "name": "snapshotStartsAnEngineWithTheSameTrustWithoutCacheOrNetwork",
+          "parameterTypes": []
+        },
+        {
+          "name": "unexpectedClassesAreRefusedBeforeTheyAreInstantiated",
+          "parameterTypes": []
+        },
+        {
+          "name": "unreadableOrDamagedFilesAreRejected",
+          "parameterTypes": []
+        }
+      ]
+    },
+    {
+      "type": "it.codingduck.dssnative.engine.TlSnapshotTest$Canary",
+      "serializable": true
+    },
+    {
+      "type": "it.codingduck.dssnative.engine.TrustedListTest",
+      "fields": [
+        {
+          "name": "tmp"
+        }
+      ],
+      "methods": [
+        {
+          "name": "<init>",
+          "parameterTypes": []
+        },
+        {
+          "name": "countryFilterLimitsTheTrustedLists",
+          "parameterTypes": []
+        },
+        {
+          "name": "emptyCacheLoadsNothingAndValidationRefuses",
+          "parameterTypes": []
+        },
+        {
+          "name": "failedOnlineRefreshKeepsPreviouslyLoadedLists",
+          "parameterTypes": []
+        },
+        {
+          "name": "lotlSignedByKeyOutsideOjKeystoreIsNotTrusted",
+          "parameterTypes": []
+        },
+        {
+          "name": "nationalListsSignedWithOtherSchemesAreAccepted",
+          "parameterTypes": [
+            "java.lang.String"
+          ]
+        },
+        {
+          "name": "onlineRefreshLoadsListsAndStatusDescribesThem",
+          "parameterTypes": []
+        },
+        {
+          "name": "secondOnlineRefreshIsRejectedWhileOneRuns",
+          "parameterTypes": []
+        },
+        {
+          "name": "startupLoadsFromCacheWithoutNetwork",
+          "parameterTypes": []
+        },
+        {
+          "name": "tlWithBrokenSignatureIsNotUsed",
+          "parameterTypes": []
+        },
+        {
+          "name": "validationWithoutTrustedListsCanBeAllowedExplicitly",
+          "parameterTypes": []
+        }
+      ]
+    },
+    {
+      "type": "it.codingduck.dssnative.engine.VisibleSignatureTest",
+      "methods": [
+        {
+          "name": "<init>",
+          "parameterTypes": []
+        },
+        {
+          "name": "aRotatedPageGetsAnUprightBoxWhereTheCallerSeesIt",
+          "parameterTypes": []
+        },
+        {
+          "name": "anExistingEmptySignatureField",
+          "parameterTypes": []
+        },
+        {
+          "name": "anImageAloneOrTextAlone",
+          "parameterTypes": []
+        },
+        {
+          "name": "anOwnerPasswordProtectedPdf",
+          "parameterTypes": []
+        },
+        {
+          "name": "badOptionsAreRefusedBeforeAnythingIsSigned",
+          "parameterTypes": []
+        },
+        {
+          "name": "everyImagePositionAndPngKind",
+          "parameterTypes": []
+        },
+        {
+          "name": "jpegAndTheCallersFontAndColours",
+          "parameterTypes": []
+        },
+        {
+          "name": "longTextShrinksAndWraps",
+          "parameterTypes": []
+        },
+        {
+          "name": "placeholdersAreFilledIn",
+          "parameterTypes": []
+        },
+        {
+          "name": "placementsThatDoNotFitTheDocumentAreRefused",
+          "parameterTypes": []
+        },
+        {
+          "name": "preparingIsRepeatableAndFollowsTheAppearance",
+          "parameterTypes": []
+        },
+        {
+          "name": "setUp",
+          "parameterTypes": [
+            "java.nio.file.Path"
+          ]
+        },
+        {
+          "name": "tearDown",
+          "parameterTypes": []
+        },
+        {
+          "name": "textBesideATransparentPng",
+          "parameterTypes": []
+        },
+        {
+          "name": "theSignerNameFallsBackToTheCertificate",
+          "parameterTypes": []
+        }
+      ]
+    },
+    {
+      "type": "it.codingduck.dssnative.testsupport.RuntimeDefaultsListener"
+    },
+    {
+      "type": "it.codingduck.dssnative.testsupport.TestEngines"
+    },
+    {
+      "type": "it.codingduck.dssnative.testsupport.TestImages"
+    },
+    {
+      "type": "it.codingduck.dssnative.testsupport.TestPki"
+    },
+    {
+      "type": "it.codingduck.dssnative.visible.SignatureImageTest",
+      "methods": [
+        {
+          "name": "<init>",
+          "parameterTypes": []
+        },
+        {
+          "name": "everyPngColourTypeAndBitDepth",
+          "parameterTypes": []
+        },
+        {
+          "name": "jpegHeaderIsReadWithoutDecoding",
+          "parameterTypes": []
+        },
+        {
+          "name": "pngSamplesMatchImageIo",
+          "parameterTypes": []
+        },
+        {
+          "name": "unsupportedImagesAreRefusedWithAReason",
+          "parameterTypes": []
+        }
+      ]
+    },
+    {
+      "type": "it.codingduck.dssnative.visible.SrgbProfileTest",
+      "methods": [
+        {
+          "name": "<init>",
+          "parameterTypes": []
+        },
+        {
+          "name": "littleCmsReadsItAsSrgb",
+          "parameterTypes": []
+        },
+        {
+          "name": "theSameBytesEveryTime",
+          "parameterTypes": []
+        }
+      ]
+    },
+    {
+      "type": "java.lang.ProcessHandle",
+      "methods": [
+        {
+          "name": "info",
+          "parameterTypes": []
+        },
+        {
+          "name": "of",
+          "parameterTypes": [
+            "long"
+          ]
+        }
+      ]
+    },
+    {
+      "type": "java.lang.ProcessHandle$Info",
+      "methods": [
+        {
+          "name": "startInstant",
+          "parameterTypes": []
+        }
+      ]
+    },
+    {
+      "type": "java.lang.StackWalker",
+      "methods": [
+        {
+          "name": "getInstance",
+          "parameterTypes": [
+            "java.util.Set",
+            "int"
+          ]
+        },
+        {
+          "name": "walk",
+          "parameterTypes": [
+            "java.util.function.Function"
+          ]
+        }
+      ]
+    },
+    {
+      "type": "java.lang.StackWalker$StackFrame",
+      "methods": [
+        {
+          "name": "getClassName",
+          "parameterTypes": []
+        },
+        {
+          "name": "getMethodName",
+          "parameterTypes": []
+        }
+      ]
+    },
+    {
+      "type": "java.time.Instant"
+    },
+    {
+      "type": "java.util.Optional"
+    },
+    {
+      "type": "java.util.function.Consumer"
+    },
+    {
+      "type": "jdk.jfr.FlightRecorder"
+    },
+    {
+      "type": "kotlin.Metadata"
+    },
+    {
+      "type": "kotlin.jvm.JvmInline"
+    },
+    {
+      "type": "org.apache.maven.surefire.booter.spi.LegacyMasterProcessChannelProcessorFactory"
+    },
+    {
+      "type": "org.apache.maven.surefire.booter.spi.SurefireMasterProcessChannelProcessorFactory"
+    },
+    {
+      "type": "org.apache.maven.surefire.junitplatform.JUnitPlatformProvider",
+      "methods": [
+        {
+          "name": "<init>",
+          "parameterTypes": [
+            "org.apache.maven.surefire.api.provider.ProviderParameters"
+          ]
+        }
+      ]
+    },
+    {
+      "type": "org.apiguardian.api.API"
+    },
+    {
+      "type": "org.junit.experimental.categories.Category"
+    },
+    {
+      "type": "org.junit.internal.AssumptionViolatedException"
+    },
+    {
+      "type": "org.junit.jupiter.api.DisplayName"
+    },
+    {
+      "type": "org.junit.jupiter.api.Tag"
+    },
+    {
+      "type": "org.junit.jupiter.api.Test"
+    },
+    {
+      "type": "org.junit.jupiter.api.TestInstance"
+    },
+    {
+      "type": "org.junit.jupiter.api.TestTemplate"
+    },
+    {
+      "type": "org.junit.jupiter.api.condition.DisabledIfSystemProperty"
+    },
+    {
+      "type": "org.junit.jupiter.api.condition.DisabledIfSystemPropertyCondition",
+      "methods": [
+        {
+          "name": "<init>",
+          "parameterTypes": []
+        }
+      ]
+    },
+    {
+      "type": "org.junit.jupiter.api.condition.DisabledInNativeImage"
+    },
+    {
+      "type": "org.junit.jupiter.api.extension.ExtendWith"
+    },
+    {
+      "type": "org.junit.jupiter.api.io.TempDir"
+    },
+    {
+      "type": "org.junit.jupiter.engine.JupiterTestEngine"
+    },
+    {
+      "type": "org.junit.jupiter.params.ParameterizedTest"
+    },
+    {
+      "type": "org.junit.jupiter.params.ParameterizedTestExtension",
+      "methods": [
+        {
+          "name": "<init>",
+          "parameterTypes": []
+        }
+      ]
+    },
+    {
+      "type": "org.junit.jupiter.params.provider.AnnotationBasedArgumentsProvider"
+    },
+    {
+      "type": "org.junit.jupiter.params.provider.ArgumentsProvider"
+    },
+    {
+      "type": "org.junit.jupiter.params.provider.ArgumentsSource"
+    },
+    {
+      "type": "org.junit.jupiter.params.provider.MethodArgumentsProvider",
+      "methods": [
+        {
+          "name": "<init>",
+          "parameterTypes": []
+        }
+      ]
+    },
+    {
+      "type": "org.junit.jupiter.params.provider.MethodSource"
+    },
+    {
+      "type": "org.junit.jupiter.params.provider.ValueArgumentsProvider",
+      "methods": [
+        {
+          "name": "<init>",
+          "parameterTypes": []
+        }
+      ]
+    },
+    {
+      "type": "org.junit.jupiter.params.provider.ValueSource"
+    },
+    {
+      "type": "org.junit.jupiter.params.support.AnnotationConsumer"
+    },
+    {
+      "type": "org.junit.platform.commons.annotation.Testable"
+    },
+    {
+      "type": "org.junit.platform.engine.CancellationToken",
+      "methods": [
+        {
+          "name": "create",
+          "parameterTypes": []
+        }
+      ]
+    },
+    {
+      "type": "org.junit.platform.engine.UniqueId$SerializedForm",
+      "serializable": true
+    },
+    {
+      "type": "org.junit.platform.launcher.Launcher",
+      "methods": [
+        {
+          "name": "execute",
+          "parameterTypes": [
+            "org.junit.platform.launcher.LauncherExecutionRequest"
+          ]
+        }
+      ]
+    },
+    {
+      "type": "org.junit.platform.launcher.LauncherExecutionRequest"
+    },
+    {
+      "type": "org.junit.platform.launcher.LauncherSession",
+      "methods": [
+        {
+          "name": "getLauncher",
+          "parameterTypes": []
+        }
+      ]
+    },
+    {
+      "type": "org.junit.platform.launcher.core.LauncherExecutionRequestBuilder",
+      "methods": [
+        {
+          "name": "build",
+          "parameterTypes": []
+        },
+        {
+          "name": "cancellationToken",
+          "parameterTypes": [
+            "org.junit.platform.engine.CancellationToken"
+          ]
+        },
+        {
+          "name": "listeners",
+          "parameterTypes": [
+            "org.junit.platform.launcher.TestExecutionListener[]"
+          ]
+        },
+        {
+          "name": "request",
+          "parameterTypes": [
+            "org.junit.platform.launcher.LauncherDiscoveryRequest"
+          ]
+        }
+      ]
+    },
+    {
+      "type": "org.junit.platform.launcher.core.LauncherFactory",
+      "methods": [
+        {
+          "name": "openSession",
+          "parameterTypes": []
+        }
+      ]
+    },
+    {
+      "type": "org.junit.platform.launcher.listeners.UniqueIdTrackingListener"
+    },
+    {
+      "type": "org.testng.annotations.Test"
+    },
+    {
+      "type": "sun.management.VMManagementImpl",
+      "jniAccessible": true,
+      "fields": [
+        {
+          "name": "compTimeMonitoringSupport"
+        },
+        {
+          "name": "currentThreadCpuTimeSupport"
+        },
+        {
+          "name": "objectMonitorUsageSupport"
+        },
+        {
+          "name": "otherThreadCpuTimeSupport"
+        },
+        {
+          "name": "remoteDiagnosticCommandsSupport"
+        },
+        {
+          "name": "synchronizerUsageSupport"
+        },
+        {
+          "name": "threadAllocatedMemorySupport"
+        },
+        {
+          "name": "threadContentionMonitoringSupport"
+        }
+      ]
+    }
+  ],
+  "resources": [
+    {
+      "glob": "META-INF/services/com.sun.net.httpserver.spi.HttpServerProvider"
+    },
+    {
+      "glob": "META-INF/services/org.apache.maven.surefire.spi.MasterProcessChannelProcessorFactory"
+    },
+    {
+      "glob": "META-INF/services/org.junit.platform.commons.support.scanning.ClasspathScanner"
+    },
+    {
+      "glob": "META-INF/services/org.junit.platform.engine.TestEngine"
+    },
+    {
+      "glob": "META-INF/services/org.junit.platform.launcher.LauncherDiscoveryListener"
+    },
+    {
+      "glob": "META-INF/services/org.junit.platform.launcher.LauncherSessionListener"
+    },
+    {
+      "glob": "META-INF/services/org.junit.platform.launcher.PostDiscoveryFilter"
+    },
+    {
+      "glob": "META-INF/services/org.junit.platform.launcher.TestExecutionListener"
+    },
+    {
+      "glob": "junit-platform.properties"
+    },
+    {
+      "module": "jdk.jfr",
+      "glob": "jdk/jfr/internal/types/metadata.bin"
+    }
+  ]
+}

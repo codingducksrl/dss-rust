@@ -1,0 +1,9 @@
+{
+  "rules": [
+    {"excludeClasses": "org.junit.**"},
+    {"excludeClasses": "org.opentest4j.**"},
+    {"excludeClasses": "org.apiguardian.**"},
+    {"excludeClasses": "org.apache.maven.**"},
+    {"excludeClasses": "it.codingduck.dssnative.**"}
+  ]
+}

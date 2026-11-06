@@ -1,0 +1,1002 @@
+openapi: 3.1.0
+info:
+  title: dss-server
+  summary: EU DSS signature validation, extension and external signing over HTTP.
+  description: |
+    `dss-server` serves one EU DSS engine (libdssnative) to applications in other languages: validate CAdES and
+    PAdES signatures, extend PAdES signatures to T, LT or LTA, and sign with a key held elsewhere. Guide:
+    [docs/server.md](https://github.com/codingduck/dss-native/blob/main/docs/server.md).
+
+    - Requests that carry a document are `multipart/form-data`. The `options` part is the library's
+      `options_json`: unknown keys are refused, and enumerated values are accepted in any case (the canonical
+      spelling is listed).
+    - JSON results are the library's own and may gain fields. A signature that fails validation is a 200 result:
+      check `signatures[].indication`.
+    - Documents come back as the response body, with the result JSON in the `Dss-Result` header.
+    - Every error is `{"ok":false,"error":{"code","message"}}`. New error codes may be added.
+
+    The server's own copy of this document is at `/openapi.yaml`, with `info.version` set to its version.
+  version: 0.0.0-dev
+  license:
+    name: LGPL-2.1-or-later
+    identifier: LGPL-2.1-or-later
+servers:
+  - url: http://127.0.0.1:8484
+    description: Default --listen address
+  - url: http://dss:8484
+    description: A Compose service named dss
+security:
+  - bearerAuth: []
+  - {}
+tags:
+  - name: Signatures
+    description: Validation, extension and external signing.
+  - name: Trusted lists
+    description: The EU trusted lists the engine validates against.
+  - name: Server
+    description: Versions, readiness and this document.
+paths:
+  /validate:
+    post:
+      tags: [Signatures]
+      operationId: validate
+      summary: Validate a signed document
+      description: >
+        Validates the signatures of a PDF (PAdES) or of a CMS/CAdES document (`.p7m`, `.p7s`, nested `.p7m.p7m`,
+        BER, base64 or PEM wrapped) and returns DSS's reports.
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [document]
+              properties:
+                document:
+                  type: string
+                  format: binary
+                  description: >
+                    The signed document. Its filename becomes `filename` in the options unless they set one: the
+                    name shown in the reports.
+                options:
+                  $ref: '#/components/schemas/ValidateOptions'
+                detached:
+                  type: array
+                  description: Signed content of a detached signature (`.p7s`); the part's filename is its name.
+                  items:
+                    type: string
+                    format: binary
+            encoding:
+              options:
+                contentType: application/json
+      responses:
+        '200':
+          description: The validation result, also when a signature does not pass.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ValidationResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '413':
+          $ref: '#/components/responses/RequestTooLarge'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+  /extend:
+    post:
+      tags: [Signatures]
+      operationId: extend
+      summary: Extend the signatures of a PDF
+      description: >
+        Extends every signature of a PDF to PAdES-BASELINE-T, -LT or -LTA. The result is the input PDF followed
+        by an incremental update, so the original signatures stay valid. LT embeds the certificates and
+        revocation data the signatures need; T and LTA add a document timestamp from the server's TSA. DSS checks
+        the signatures first and refuses with `EXTENSION_FAILED` when one does not validate, a certificate is
+        revoked or expired, revocation data is missing, a signature is already at a higher level, or a timestamp
+        is needed and no TSA is configured.
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [document, options]
+              properties:
+                document:
+                  type: string
+                  format: binary
+                  description: The signed PDF (also base64 or PEM wrapped).
+                options:
+                  $ref: '#/components/schemas/ExtendOptions'
+            encoding:
+              options:
+                contentType: application/json
+      responses:
+        '200':
+          description: The extended PDF.
+          headers:
+            Dss-Result:
+              $ref: '#/components/headers/ExtendResult'
+          content:
+            application/pdf:
+              schema:
+                type: string
+                format: binary
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '413':
+          $ref: '#/components/responses/RequestTooLarge'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+  /sign/prepare:
+    post:
+      tags: [Signatures]
+      operationId: prepareSignature
+      summary: 'Signing, step 1: the digest for the external signer'
+      description: >
+        Returns the digest the external signer must sign, and the signing time the signature will claim. Needs no
+        network and no trusted lists. Refuses a signing certificate that is expired or not yet valid at the
+        signing time. Nothing is kept on the server: step 2 may run much later, on another instance.
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [document, options]
+              properties:
+                document:
+                  type: string
+                  format: binary
+                  description: The document to sign. Its filename is not used.
+                options:
+                  $ref: '#/components/schemas/SignOptions'
+            encoding:
+              options:
+                contentType: application/json
+      responses:
+        '200':
+          description: What to send to the external signer.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PreparedSignature'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '413':
+          $ref: '#/components/responses/RequestTooLarge'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+  /sign/complete:
+    post:
+      tags: [Signatures]
+      operationId: completeSignature
+      summary: 'Signing, step 2: the signed document'
+      description: >
+        Builds the signed document from what the external signer returned, and adds the level asked for. Send the
+        same document and options as to `/sign/prepare`, with `signing_time` set to the one it returned: anything
+        else gives another digest, and the signature is refused (`SIGNING_FAILED`, "not this document's
+        digest").
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [document, options, signature]
+              properties:
+                document:
+                  type: string
+                  format: binary
+                  description: The same document as for `/sign/prepare`.
+                options:
+                  $ref: '#/components/schemas/SignOptions'
+                signature:
+                  type: string
+                  format: binary
+                  description: >
+                    What the external signer returned. `cms` mode: a detached CMS SignedData (DER, BER, base64 or
+                    PEM). `signature_value` mode: the bare signature value (RSA PKCS#1 v1.5, or ECDSA as DER or
+                    r‖s), raw or base64.
+            encoding:
+              options:
+                contentType: application/json
+      responses:
+        '200':
+          description: The signed document.
+          headers:
+            Dss-Result:
+              $ref: '#/components/headers/SignResult'
+          content:
+            application/pdf:
+              schema:
+                description: PAdES.
+                type: string
+                format: binary
+            application/pkcs7-signature:
+              schema:
+                description: CAdES detached (`.p7s`).
+                type: string
+                format: binary
+            application/pkcs7-mime:
+              schema:
+                description: CAdES enveloping (`.p7m`).
+                type: string
+                format: binary
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '413':
+          $ref: '#/components/responses/RequestTooLarge'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+  /tl/status:
+    get:
+      tags: [Trusted lists]
+      operationId: trustedListStatus
+      summary: Trusted-list status
+      description: What is loaded, the last refreshes, per-list state and alerts. Never waits for a running refresh.
+      responses:
+        '200':
+          description: The status.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TrustedListStatus'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+  /tl/refresh:
+    post:
+      tags: [Trusted lists]
+      operationId: refreshTrustedLists
+      summary: Start an online refresh
+      description: >
+        Starts downloading and validating the LOTL and national trusted lists, and answers at once.
+        `/tl/status` shows the progress (`refresh_in_progress`) and the outcome (`last_online_refresh`). Requests
+        keep being served during the refresh, against the previous lists.
+      responses:
+        '202':
+          description: The refresh started.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Accepted'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          description: A refresh is already running.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                ok: false
+                error:
+                  code: REFRESH_IN_PROGRESS
+                  message: an online refresh is already running
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+  /version:
+    get:
+      tags: [Server]
+      operationId: version
+      summary: Server, library and DSS versions
+      responses:
+        '200':
+          description: The versions.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Version'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+  /health:
+    get:
+      tags: [Server]
+      operationId: health
+      summary: Readiness
+      description: 200 once the engine is up, 503 while it starts. For container health checks; needs no token.
+      security: []
+      responses:
+        '200':
+          description: The engine is up.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+        '503':
+          description: The engine is starting.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/Starting'
+                  - $ref: '#/components/schemas/Error'
+  /openapi.yaml:
+    get:
+      tags: [Server]
+      operationId: openapi
+      summary: This document
+      description: The server's copy of this document, with `info.version` set to the server's version. Needs no token.
+      security: []
+      responses:
+        '200':
+          description: The OpenAPI document.
+          content:
+            application/yaml:
+              schema:
+                type: string
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: >
+        Only when the server runs with `--token-file`: every endpoint but `/health` and `/openapi.yaml` then needs
+        `Authorization: Bearer <the file's content>`.
+  headers:
+    ExtendResult:
+      description: The result JSON, compact; any non-ASCII character is escaped as `\uXXXX`.
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ExtendResult'
+    SignResult:
+      description: The result JSON, compact; any non-ASCII character is escaped as `\uXXXX`.
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/SignResult'
+  responses:
+    BadRequest:
+      description: >
+        `INVALID_ARGUMENT`: not multipart, a missing, repeated or unexpected part, options that are not a JSON
+        object, an unknown option or a bad value.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            ok: false
+            error:
+              code: INVALID_ARGUMENT
+              message: "missing part 'document'"
+    Unauthorized:
+      description: '`UNAUTHORIZED`: the server runs with a token, and the request has none or another.'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            ok: false
+            error:
+              code: UNAUTHORIZED
+              message: missing or wrong bearer token
+    RequestTooLarge:
+      description: '`REQUEST_TOO_LARGE`: the request is over the server''s `--max-request-mb`.'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Unprocessable:
+      description: >
+        The document cannot be processed: `UNSUPPORTED_DOCUMENT` (neither a PDF nor a CMS/CAdES document, or a
+        CMS given to `/extend`), `VALIDATION_FAILED`, `EXTENSION_FAILED` or `SIGNING_FAILED`, with DSS's reason in
+        the message.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            ok: false
+            error:
+              code: UNSUPPORTED_DOCUMENT
+              message: not a PDF or CMS/CAdES document (also tried base64 and PEM decoding)
+    InternalError:
+      description: >
+        `INTERNAL_ERROR` (anything unexpected in the library, including running out of heap) or `INVALID_CONFIG`.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Unavailable:
+      description: >
+        `NOT_INITIALIZED`: the engine is starting; retry shortly. `TRUSTED_LISTS_NOT_LOADED`: no trusted list is
+        loaded yet (the first online refresh is still running).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            ok: false
+            error:
+              code: NOT_INITIALIZED
+              message: the engine is starting
+  schemas:
+    Error:
+      type: object
+      required: [ok, error]
+      properties:
+        ok:
+          const: false
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              description: >
+                The library's: `INVALID_ARGUMENT`, `INVALID_CONFIG`, `NOT_INITIALIZED`, `TRUSTED_LISTS_NOT_LOADED`,
+                `REFRESH_IN_PROGRESS`, `TL_REFRESH_FAILED`, `UNSUPPORTED_DOCUMENT`, `VALIDATION_FAILED`,
+                `EXTENSION_FAILED`, `SIGNING_FAILED`, `INTERNAL_ERROR`. The server's: `UNAUTHORIZED`, `NOT_FOUND`,
+                `REQUEST_TOO_LARGE`. New codes may be added.
+              examples: [EXTENSION_FAILED]
+            message:
+              type: string
+    ValidateOptions:
+      type: object
+      description: The library's validation `options_json`. All optional.
+      additionalProperties: false
+      properties:
+        reports:
+          type: array
+          description: >
+            XML reports to return besides the simple report, which is always included. Replaces the server's
+            default set.
+          items:
+            enum: [simple, detailed, etsi, diagnostic]
+        detached_contents:
+          type: array
+          description: >
+            Signed content of a detached signature, as base64. The `detached` part is the other way to send it; a
+            `path` is refused.
+          items:
+            $ref: '#/components/schemas/DetachedContent'
+        validation_time:
+          type: string
+          format: date-time
+          description: Validate as of this instant instead of now.
+          examples: ['2026-01-31T12:00:00Z']
+        filename:
+          type: string
+          description: The document's name in the reports. Default the `document` part's filename.
+        unwrap_nested:
+          type: boolean
+          default: true
+          description: Also validate a CAdES envelope nested in the signed content (`.p7m.p7m`).
+    DetachedContent:
+      type: object
+      additionalProperties: false
+      required: [base64]
+      properties:
+        name:
+          type: string
+        base64:
+          type: string
+          contentEncoding: base64
+    ExtendOptions:
+      type: object
+      additionalProperties: false
+      required: [level]
+      properties:
+        level:
+          enum: [T, LT, LTA]
+          description: The target level. Case-insensitive.
+        filename:
+          type: string
+          description: The document's name in DSS's messages. Default the `document` part's filename.
+    SignOptions:
+      type: object
+      description: >
+        The same options for both steps; for `/sign/complete`, with `signing_time` as `/sign/prepare` returned
+        it. The server passes them on unchanged and adds no filename. Enumerated values are case-insensitive.
+      additionalProperties: false
+      required: [mode, level]
+      properties:
+        mode:
+          enum: [cms, signature_value]
+          description: >
+            `cms`: the signer receives the content's digest (PAdES: of the PDF's signed byte ranges) and returns a
+            detached CMS. `signature_value`: the signer receives the digest of the signed attributes DSS built
+            (RSA signers wrap it in a DigestInfo) and returns the bare signature value; needs
+            `signing_certificate`.
+        level:
+          enum: [B, T, LT, LTA]
+          description: >
+            B is what the signer delivers. T adds a timestamp from the server's TSA (unless an external CMS has its
+            own signature timestamp), LT the certificates and revocation data, LTA both. LT and LTA need trusted
+            lists.
+        format:
+          enum: [PAdES, CAdES]
+          description: Default PAdES for a PDF, CAdES otherwise.
+        digest_algorithm:
+          enum: [SHA256, SHA384, SHA512]
+          default: SHA256
+        signing_time:
+          type: string
+          format: date-time
+          description: >
+            Whole seconds, UTC. `/sign/prepare`: default now. `/sign/complete`: required, as `/sign/prepare`
+            returned it.
+          examples: ['2026-10-28T10:15:30Z']
+        signing_certificate:
+          type: string
+          description: >
+            The signer's certificate, base64 DER or PEM. Required for `signature_value`; with `cms`, the CMS must
+            be signed with it.
+        certificate_chain:
+          type: array
+          description: Issuer certificates (base64 DER or PEM), put into the CMS DSS builds and used for LT and LTA.
+          items:
+            type: string
+        packaging:
+          enum: [detached, enveloping]
+          default: detached
+          description: 'CAdES only: `.p7s` beside the content, or `.p7m` around it.'
+        filename:
+          type: string
+          description: The document's name. For PAdES it enters the prepared PDF.
+        pades:
+          $ref: '#/components/schemas/PadesOptions'
+    PadesOptions:
+      type: object
+      description: PAdES only. Signature dictionary entries, and the space reserved for the CMS.
+      additionalProperties: false
+      properties:
+        reason:
+          type: string
+        location:
+          type: string
+        contact_info:
+          type: string
+        signer_name:
+          type: string
+        content_size:
+          type: integer
+          minimum: 1
+          description: Bytes reserved for the CMS. Default 32768 (`cms`), 9472 (`signature_value`).
+        visible:
+          $ref: '#/components/schemas/VisibleSignature'
+    VisibleSignature:
+      type: object
+      description: >
+        A visible appearance: a box showing text, an image, or both. Either an existing empty signature field, or
+        a new field at a position. Default: an invisible signature.
+      additionalProperties: false
+      oneOf:
+        - required: [field]
+        - required: [page, x, y, width, height]
+      properties:
+        field:
+          type: string
+          description: An empty signature field of the PDF, by name.
+        page:
+          type: integer
+          minimum: 1
+        x:
+          type: number
+          description: Points (1/72 inch) from the left edge of the page as displayed.
+        y:
+          type: number
+          description: Points from the top edge of the page as displayed.
+        width:
+          type: number
+          exclusiveMinimum: 0
+        height:
+          type: number
+          exclusiveMinimum: 0
+        text:
+          type: string
+          description: >
+            Lines separated by `\n`. Placeholders `{signer_name}`, `{signing_time}`, `{reason}`, `{location}`;
+            `{{` and `}}` for literal braces.
+        font:
+          type: string
+          contentEncoding: base64
+          description: A TrueType font (TTF, or OTF with TrueType outlines). Default PT Serif.
+        font_size:
+          type: number
+          minimum: 4
+          maximum: 200
+          default: 10
+          description: The largest size; the text shrinks and wraps at spaces to fit.
+        text_color:
+          type: string
+          pattern: '^#[0-9A-Fa-f]{6}$'
+          default: '#000000'
+        text_align:
+          enum: [left, center, right]
+          default: left
+        background_color:
+          type: string
+          pattern: '^#[0-9A-Fa-f]{6}$'
+          description: Default none (transparent).
+        image:
+          type: string
+          contentEncoding: base64
+          description: A PNG or a JPEG, up to 25 megapixels.
+        image_position:
+          enum: [left, right, top, bottom, behind]
+          default: left
+        time_zone:
+          type: string
+          default: UTC
+          examples: [Europe/Rome]
+        date_format:
+          type: string
+          default: yyyy-MM-dd HH:mm:ss xxx
+          description: A java.time pattern for `{signing_time}`.
+    ValidationResult:
+      allOf:
+        - $ref: '#/components/schemas/Reports'
+        - type: object
+          required: [ok]
+          properties:
+            ok:
+              const: true
+    Reports:
+      type: object
+      required: [container, signatures, simple_report_xml]
+      properties:
+        container:
+          enum: [PDF, CMS]
+        transformations:
+          type: array
+          description: Encodings removed before validation.
+          items:
+            type: string
+            examples: [base64]
+        signatures:
+          type: array
+          items:
+            $ref: '#/components/schemas/SignatureSummary'
+        simple_report_xml:
+          type: string
+        detailed_report_xml:
+          type: string
+          description: When requested.
+        etsi_report_xml:
+          type: string
+          description: When requested.
+        diagnostic_data_xml:
+          type: string
+          description: When requested.
+        nested:
+          type: array
+          description: The validation of a CAdES envelope inside the signed content (`.p7m.p7m`).
+          items:
+            $ref: '#/components/schemas/Reports'
+    SignatureSummary:
+      type: object
+      required: [id, indication]
+      properties:
+        id:
+          type: string
+        indication:
+          enum: [TOTAL_PASSED, PASSED, INDETERMINATE, FAILED, TOTAL_FAILED, NO_SIGNATURE_FOUND]
+          description: DSS's outcome (ETSI EN 319 102-1).
+        sub_indication:
+          type: [string, 'null']
+          examples: [HASH_FAILURE]
+        format:
+          type: [string, 'null']
+          examples: [PAdES-BASELINE-LTA]
+        qualification:
+          type: [string, 'null']
+          examples: [QESIG]
+        signing_time:
+          type: [string, 'null']
+          format: date-time
+        best_signature_time:
+          type: [string, 'null']
+          format: date-time
+        signed_by:
+          type: [string, 'null']
+        signer_dn:
+          type: [string, 'null']
+          description: Subject DN of the signing certificate (RFC 2253).
+        errors:
+          type: array
+          items:
+            type: string
+        warnings:
+          type: array
+          items:
+            type: string
+    ExtendResult:
+      type: object
+      required: [ok, container, level]
+      properties:
+        ok:
+          const: true
+        container:
+          const: PDF
+        transformations:
+          type: array
+          items:
+            type: string
+        level:
+          type: string
+          examples: [PAdES-BASELINE-LT]
+    PreparedSignature:
+      type: object
+      required: [ok, format, digest_algorithm, digest, signing_time]
+      properties:
+        ok:
+          const: true
+        format:
+          enum: [PAdES, CAdES]
+        digest_algorithm:
+          enum: [SHA256, SHA384, SHA512]
+        digest:
+          type: string
+          contentEncoding: base64
+          description: What the external signer signs.
+        data_to_sign:
+          type: string
+          contentEncoding: base64
+          description: '`signature_value` only: the DER signed attributes, for signers that hash the data themselves.'
+        signing_time:
+          type: string
+          format: date-time
+          description: Pass it to `/sign/complete` in the options.
+    SignResult:
+      type: object
+      required: [ok, format, level, packaging]
+      properties:
+        ok:
+          const: true
+        format:
+          enum: [PAdES, CAdES]
+        level:
+          type: string
+          description: The level reached, which may be above the one asked (a CMS with its own timestamp is T).
+          examples: [PAdES-BASELINE-LT]
+        packaging:
+          enum: [ENVELOPED, DETACHED, ENVELOPING]
+    TrustedListStatus:
+      type: object
+      required: [ok, loaded, trusted_certificates, refresh_in_progress]
+      properties:
+        ok:
+          const: true
+        loaded:
+          type: boolean
+        trusted_certificates:
+          type: integer
+        snapshot_published_at:
+          type: [string, 'null']
+          format: date-time
+        tl_snapshot:
+          description: >-
+            The trusted-list snapshot the lists came from (`tl_snapshot` in the server's `--config` file): its
+            header, `path` and `size`. Absent when they came from the cache or an online refresh.
+          type: object
+          properties:
+            path:
+              type: string
+            size:
+              type: integer
+            format:
+              type: integer
+            library:
+              type: string
+            dss:
+              type: string
+            created_at:
+              type: string
+              format: date-time
+            lists_loaded:
+              $ref: '#/components/schemas/RefreshRecord'
+            trusted_certificates:
+              type: integer
+            settings:
+              type: object
+        refresh_in_progress:
+          type: boolean
+        refresh_started_at:
+          type: [string, 'null']
+          format: date-time
+        last_offline_refresh:
+          oneOf:
+            - $ref: '#/components/schemas/RefreshRecord'
+            - type: 'null'
+        last_online_refresh:
+          oneOf:
+            - $ref: '#/components/schemas/RefreshRecord'
+            - type: 'null'
+        lotls:
+          type: array
+          items:
+            $ref: '#/components/schemas/ListStatus'
+        tls:
+          type: array
+          items:
+            $ref: '#/components/schemas/ListStatus'
+        alerts:
+          type: array
+          items:
+            $ref: '#/components/schemas/Alert'
+    RefreshRecord:
+      type: object
+      required: [mode, started_at, finished_at, duration_ms, completed, trusted_certificates]
+      properties:
+        mode:
+          description: '`offline` (from the cache), `online`, or `snapshot` (from a trusted-list snapshot).'
+          type: string
+          examples: [online]
+        started_at:
+          type: string
+          format: date-time
+        finished_at:
+          type: string
+          format: date-time
+        duration_ms:
+          type: integer
+        completed:
+          type: boolean
+          description: False only if the refresh could not run at all; per-list problems are in the lists' state.
+        error:
+          type: [string, 'null']
+        trusted_certificates:
+          type: integer
+    ListStatus:
+      type: object
+      description: A list of trusted lists (LOTL) or a national trusted list.
+      required: [url]
+      properties:
+        url:
+          type: string
+        territory:
+          type: [string, 'null']
+        sequence_number:
+          type: [integer, 'null']
+        version:
+          type: [integer, 'null']
+        issue_date:
+          type: [string, 'null']
+          format: date-time
+        next_update:
+          type: [string, 'null']
+          format: date-time
+        expired:
+          type: [boolean, 'null']
+        tsp_count:
+          type: [integer, 'null']
+        service_count:
+          type: [integer, 'null']
+        certificate_count:
+          type: [integer, 'null']
+        used_for_trust:
+          type: [boolean, 'null']
+          description: Whether its certificates are trust anchors.
+        download:
+          $ref: '#/components/schemas/Stage'
+        parsing:
+          $ref: '#/components/schemas/Stage'
+        validation:
+          $ref: '#/components/schemas/Stage'
+        pivots:
+          type: array
+          items:
+            $ref: '#/components/schemas/ListStatus'
+    Stage:
+      type: object
+      description: Download, parsing or signature-validation state of a list.
+      properties:
+        status:
+          type: [string, 'null']
+        last_state_transition:
+          type: [string, 'null']
+          format: date-time
+        last_success_synchronization:
+          type: [string, 'null']
+          format: date-time
+        error:
+          type: [string, 'null']
+        error_first_seen:
+          type: [string, 'null']
+          format: date-time
+        error_last_seen:
+          type: [string, 'null']
+          format: date-time
+        indication:
+          type: [string, 'null']
+          description: 'Validation stage only: the signature indication of the list.'
+        sub_indication:
+          type: [string, 'null']
+        signing_time:
+          type: [string, 'null']
+          format: date-time
+        signed_by:
+          type: [string, 'null']
+    Alert:
+      type: object
+      required: [type, message, at]
+      properties:
+        type:
+          type: string
+          description: '`oj_url_changed`, `lotl_location_changed`, `tl_signature_error` or `tl_expired`.'
+        url:
+          type: [string, 'null']
+        message:
+          type: string
+        at:
+          type: string
+          format: date-time
+    Accepted:
+      type: object
+      required: [ok]
+      properties:
+        ok:
+          const: true
+    Version:
+      type: object
+      required: [ok, server, library, dss, runtime]
+      properties:
+        ok:
+          const: true
+        server:
+          type: string
+        library:
+          type: string
+        dss:
+          type: string
+          examples: [6.5.1]
+        runtime:
+          type: string
+    Health:
+      type: object
+      required: [ok, status, trusted_lists_loaded, refresh_in_progress]
+      properties:
+        ok:
+          const: true
+        status:
+          const: ready
+        trusted_lists_loaded:
+          type: boolean
+        refresh_in_progress:
+          type: boolean
+    Starting:
+      type: object
+      required: [ok, status]
+      properties:
+        ok:
+          const: false
+        status:
+          const: starting

@@ -1,0 +1,55 @@
+# SPDX-FileCopyrightText: 2026 Coding Duck
+# SPDX-License-Identifier: LGPL-2.1-or-later
+
+name: Set up dss-native build
+description: GraalVM CE (pinned, checksum-verified), Rust toolchain, libclang, and caches for Maven and Cargo.
+inputs:
+  platform:
+    description: linux-x64, linux-aarch64 or macos-aarch64
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Cache GraalVM CE
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ~/graalvm
+        key: graalvm-ce-25.4.4.1.1-${{ inputs.platform }}
+
+    - name: Install GraalVM CE
+      shell: bash
+      run: echo "JAVA_HOME=$(scripts/ci/install-graalvm.sh "$HOME/graalvm")" >> "$GITHUB_ENV"
+
+    # build-essential, zlib1g-dev: native-image's documented Linux prerequisites (it links with -lz).
+    # libclang-dev: bindgen (dss-sys). unzip: without it the Maven wrapper fetches the .tar.gz distribution,
+    # whose checksum differs from the pinned .zip one, and fails.
+    - name: Native toolchain packages
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        sudo apt-get update -q
+        sudo apt-get install -y -q --no-install-recommends build-essential zlib1g-dev libclang-dev unzip
+
+    - name: Rust toolchain (rust/rust-toolchain.toml)
+      shell: bash
+      working-directory: rust
+      run: |
+        channel="$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
+        rustup toolchain install "$channel" --profile minimal --component clippy,rustfmt
+        rustc --version
+
+    - name: Cache Maven repository
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ~/.m2/repository
+        key: maven-${{ inputs.platform }}-${{ hashFiles('java/pom.xml', 'java/.mvn/wrapper/maven-wrapper.properties') }}
+        restore-keys: maven-${{ inputs.platform }}-
+
+    - name: Cache Cargo
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+        key: cargo-${{ inputs.platform }}-${{ hashFiles('rust/Cargo.lock') }}
+        restore-keys: cargo-${{ inputs.platform }}-
