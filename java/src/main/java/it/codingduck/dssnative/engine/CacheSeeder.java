@@ -11,12 +11,13 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * Builds a trusted-list cache snapshot to ship with the application: an online refresh into {@code cache_dir}.
- * Used by {@code scripts/seed-tl-cache.sh} (on the JVM) until the native CLI exists.
+ * Fills a trusted-list cache to ship with the application as a seed cache: an online refresh into
+ * {@code cache_dir}. Used by {@code scripts/seed-tl-cache.sh} (on the JVM); {@code dss-cli tl refresh} does the same
+ * natively.
  *
  * <pre>CacheSeeder &lt;cache_dir&gt; &lt;config.json&gt;</pre>
  *
- * Exit status: 0 when every list downloaded and validated, 1 when some list has a problem (the snapshot is still
+ * Exit status: 0 when every list downloaded and validated, 1 when some list has a problem (the cache is still
  * written), 2 when nothing could be loaded.
  */
 public final class CacheSeeder {

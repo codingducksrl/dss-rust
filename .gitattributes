@@ -1,0 +1,24 @@
+# Signed documents, signatures and keys are hashed byte for byte: git must never rewrite their line endings.
+# Without these rules core.autocrlf=input stripped the CRLFs out of PDFs that happen to hold no NUL byte, so the
+# committed fixtures no longer matched their signatures (FORMAT_FAILURE, "message-digest attribute value does
+# not match calculated value") although the working copies they were committed from validated fine.
+*.pdf   binary
+*.p7m   binary
+*.p7s   binary
+*.sig   binary
+*.p12   binary
+*.pfx   binary
+*.jks   binary
+*.der   binary
+*.cer   binary
+*.crt   binary
+*.crl   binary
+*.tsr   binary
+*.jpg   binary
+*.png   binary
+
+# Fixtures are signed or compared as they are, whatever their type.
+testdata/fixtures/** -text
+
+# The Maven wrapper's Windows script needs CRLF.
+*.cmd   text eol=crlf
