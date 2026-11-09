@@ -47,6 +47,13 @@ precedence = "aggregate"
 SPDX-FileCopyrightText = "2026 Coding Duck"
 SPDX-License-Identifier = "LGPL-2.1-or-later"
 
+# The audit report and its post-remediation status view: generated HTML, no header of their own.
+[[annotations]]
+path = ["audit.html", "audit-2.html"]
+precedence = "aggregate"
+SPDX-FileCopyrightText = "2026 Coding Duck"
+SPDX-License-Identifier = "LGPL-2.1-or-later"
+
 # The OJ keystore, copied unchanged from the DSS demonstrations 6.5.1 (trust/README.md).
 [[annotations]]
 path = "trust/oj-keystore.p12"

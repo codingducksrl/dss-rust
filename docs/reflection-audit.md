@@ -79,7 +79,7 @@ touches comes from the model classes and their annotations:
 | Site | Class | Covered by |
 |---|---|---|
 | `BouncyCastleProvider.loadServiceClass` / `ClassUtil.loadClass`: provider constructor loads `…$Mappings` classes by name | data-driven | `DssFeature`: 130 `$Mappings` classes, public constructors |
-| JCA `Provider.Service.newInstance`: algorithm name from the CMS/PDF/XML being validated | data-driven | `DssFeature`: all 1,452 classes listed by `BouncyCastleProvider.getServices()` (instantiated once in the image builder to read the list), public constructors |
+| JCA `Provider.Service.newInstance`: algorithm name from the CMS/PDF/XML being validated | data-driven | `DssFeature`: all 1,452 classes listed by `BouncyCastleProvider.getServices()` (the provider instance the feature installs in `Security` at build time; docs/native-library.md, "Security providers"), public constructors |
 | `GcmSpecUtil`, `SpecUtil`, `BaseSecretKeyFactory`, `DRBG.findSource` | data-driven | Not used by signature validation. Listed as residual risk: the DRBG path only runs if BC is asked for its own `SecureRandom` |
 | `X509CertificateHolder` / `XMSSUtil` Java serialization | — | Unreachable in practice (no Java serialization in the engine) |
 

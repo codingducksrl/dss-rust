@@ -9,6 +9,8 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.security.Provider;
+import java.security.Security;
 import java.util.ArrayList;
 import java.util.Date;
 import java.util.EnumMap;
@@ -22,6 +24,7 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 import org.apache.hc.client5.http.ssl.TrustAllStrategy;
+import org.bouncycastle.jce.provider.BouncyCastleProvider;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.slf4j.event.Level;
@@ -53,6 +56,7 @@ import eu.europa.esig.dss.service.http.proxy.ProxyConfig;
 import eu.europa.esig.dss.service.http.proxy.ProxyProperties;
 import eu.europa.esig.dss.service.ocsp.OnlineOCSPSource;
 import eu.europa.esig.dss.service.tsp.OnlineTSPSource;
+import eu.europa.esig.dss.spi.DSSSecurityProvider;
 import eu.europa.esig.dss.spi.DSSUtils;
 import eu.europa.esig.dss.spi.client.http.DataLoader;
 import eu.europa.esig.dss.spi.client.http.Protocol;
@@ -79,6 +83,18 @@ import it.codingduck.dssnative.visible.AwtFreePdfObjFactory;
 public final class DssEngine implements AutoCloseable {
 
     private static final Logger LOG = LoggerFactory.getLogger(DssEngine.class);
+
+    static {
+        // DSS creates its own BouncyCastleProvider unless given one. In the native image the provider is installed
+        // at build time (DssFeature) and the JDK's JCE verifies providers per instance, so DSS must use that one:
+        // a second instance fails the check wherever JCE consults every installed provider (TLS 1.3's hybrid key
+        // exchange does). On a JVM "BC" is the instance DSS installed itself, or one the host application installed
+        // first, which is what DSS's own setSecurityProvider(String) would pick too.
+        Provider bc = Security.getProvider(BouncyCastleProvider.PROVIDER_NAME);
+        if (bc != null) {
+            DSSSecurityProvider.setSecurityProvider(bc);
+        }
+    }
 
     /** Bound on {@code .p7m.p7m…} unwrapping. */
     static final int MAX_NESTING = 8;

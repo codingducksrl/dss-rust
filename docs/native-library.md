@@ -248,9 +248,13 @@ not exposed by this API.
 
 ## Security providers
 
-DSS registers BouncyCastle at run time (`Security.addProvider`), and resolves algorithms by name from the
-documents being validated. `DssFeature` registers every BouncyCastle service class for reflection. The JDK's
-own providers (SUN, SunRsaSign, SunEC, SunJCE, SunJSSE) are included by Native Image automatically.
+DSS resolves algorithms by name from the documents being validated, through BouncyCastle. `DssFeature`
+registers every BouncyCastle service class for reflection and installs the provider in `java.security.Security`
+at build time, next to the JDK's own providers (SUN, SunRsaSign, SunEC, SunJCE, SunJSSE), which Native Image
+includes automatically. Native Image verifies JCE providers in the image builder and keys the result by
+provider instance, so the instance DSS would create at run time (`DSSSecurityProvider`) would fail that check:
+JDK 25.0.5's TLS 1.3 hybrid key exchange asks every installed provider for `KEM.ML-KEM`, and every handshake
+failed in the image built with GraalVM 25.5 (v0.6.0). `DssEngine` therefore hands the image's instance to DSS.
 
 ## Performance
 

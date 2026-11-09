@@ -205,11 +205,22 @@ public final class TestPki {
      */
     public static byte[] crl(X509Certificate issuer, PrivateKey issuerKey, Map<BigInteger, Instant> revoked,
                              Instant thisUpdate) {
+        return crl(issuer, issuerKey, revoked, thisUpdate,
+                thisUpdate.truncatedTo(ChronoUnit.SECONDS).plus(7, ChronoUnit.DAYS));
+    }
+
+    /**
+     * As {@link #crl(X509Certificate, PrivateKey, Map, Instant)}, valid until {@code nextUpdate} instead of for 7 days.
+     * Both times are truncated to the second, as the encoding does: give a {@code nextUpdate} at least a second away
+     * from now when the test needs it on a definite side of now.
+     */
+    public static byte[] crl(X509Certificate issuer, PrivateKey issuerKey, Map<BigInteger, Instant> revoked,
+                             Instant thisUpdate, Instant nextUpdate) {
         try {
             Instant now = thisUpdate.truncatedTo(ChronoUnit.SECONDS);
             X509v2CRLBuilder b = new X509v2CRLBuilder(X500Name.getInstance(issuer.getSubjectX500Principal().getEncoded()),
                     Date.from(now));
-            b.setNextUpdate(Date.from(now.plus(7, ChronoUnit.DAYS)));
+            b.setNextUpdate(Date.from(nextUpdate.truncatedTo(ChronoUnit.SECONDS)));
             for (Map.Entry<BigInteger, Instant> r : revoked.entrySet()) {
                 b.addCRLEntry(r.getKey(), Date.from(r.getValue()), CRLReason.keyCompromise);
             }

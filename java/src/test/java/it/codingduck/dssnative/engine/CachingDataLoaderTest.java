@@ -10,16 +10,12 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-import java.math.BigInteger;
 import java.nio.charset.StandardCharsets;
-import java.security.KeyPair;
-import java.security.KeyPairGenerator;
-import java.util.Date;
+import java.time.Duration;
+import java.time.Instant;
 import java.util.List;
+import java.util.Map;
 
-import org.bouncycastle.asn1.x500.X500Name;
-import org.bouncycastle.cert.X509v2CRLBuilder;
-import org.bouncycastle.operator.jcajce.JcaContentSignerBuilder;
 import org.junit.jupiter.api.Test;
 
 import eu.europa.esig.dss.spi.client.http.DataLoader;
@@ -117,34 +113,43 @@ class CachingDataLoaderTest {
                 "a TTL shorter than the unparseable bound wins");
 
         long tenSeconds = 10_000;
-        byte[] soon = crlExpiringIn(tenSeconds);
+        byte[] soon = crlExpiringIn(pki, tenSeconds);
         long ttl = CachingDataLoader.ttlFor(soon, hour, System.currentTimeMillis());
         assertTrue(ttl > 0 && ttl <= tenSeconds + 1_000, "a CRL is never kept past its nextUpdate (to the second): " + ttl);
-        assertEquals(0, CachingDataLoader.ttlFor(crlExpiringIn(-tenSeconds), hour, System.currentTimeMillis()),
+        assertEquals(0, CachingDataLoader.ttlFor(crlExpiringIn(pki, -tenSeconds), hour, System.currentTimeMillis()),
                 "already stale: not reused");
     }
 
     @Test
     void aCrlIsFetchedAgainOnceItsNextUpdateHasPassed() throws Exception {
-        FakeHttp http = new FakeHttp().route(CRL, crlExpiringIn(120));
+        // Validity hours away from now on either side, so that neither the second-precision encoding of
+        // nextUpdate nor a slow runner can move a CRL to the other side of it.
+        TestPki pki = TestPki.load();
+        String staleCrl = "http://crl.example.test/stale.crl";
+        FakeHttp http = new FakeHttp()
+                .route(CRL, crlExpiringIn(pki, Duration.ofHours(1).toMillis()))
+                .route(staleCrl, crlExpiringIn(pki, -Duration.ofHours(1).toMillis()));
         CachingDataLoader cache = new CachingDataLoader(http, 60_000);
         cache.get(CRL);
         cache.get(CRL);
         assertEquals(1, http.hits(CRL), "within nextUpdate: cached");
-        Thread.sleep(200);
-        cache.get(CRL);
-        assertEquals(2, http.hits(CRL), "past nextUpdate: fetched again although the TTL has a minute left");
+        cache.get(staleCrl);
+        // A body with no time left expires at the millisecond it was stored, not before: let that millisecond pass.
+        long storedBy = System.currentTimeMillis();
+        while (System.currentTimeMillis() <= storedBy) {
+            Thread.sleep(1);
+        }
+        cache.get(staleCrl);
+        assertEquals(2, http.hits(staleCrl), "past nextUpdate: fetched again although the TTL has a minute left");
     }
 
-    /** A syntactically valid CRL (parsing does not check its signature) whose nextUpdate is {@code ms} from now. */
-    private static byte[] crlExpiringIn(long ms) throws Exception {
-        KeyPairGenerator g = KeyPairGenerator.getInstance("RSA");
-        g.initialize(2048);
-        KeyPair kp = g.generateKeyPair();
-        Date now = new Date();
-        X509v2CRLBuilder b = new X509v2CRLBuilder(new X500Name("CN=Some CA"), now);
-        b.setNextUpdate(new Date(now.getTime() + ms));
-        b.addCRLEntry(BigInteger.ONE, now, 0);
-        return b.build(new JcaContentSignerBuilder("SHA256withRSA").build(kp.getPrivate())).getEncoded();
+    /**
+     * A CRL from the test root issued an hour before now, whose nextUpdate is {@code ms} from now (to the second, as
+     * it is encoded: up to a second earlier).
+     */
+    private static byte[] crlExpiringIn(TestPki pki, long ms) {
+        Instant now = Instant.now();
+        return TestPki.crl(pki.x509(Entity.ROOT_CA), pki.key(Entity.ROOT_CA), Map.of(),
+                now.minus(Duration.ofHours(1)).minusMillis(Math.max(0, -ms)), now.plusMillis(ms));
     }
 }

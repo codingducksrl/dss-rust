@@ -8,14 +8,22 @@ package it.codingduck.dssnative.nativeimage;
 import java.io.IOException;
 import java.io.Serializable;
 import java.io.UncheckedIOException;
+import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.security.Provider;
+import java.security.Security;
 import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
 import java.util.Enumeration;
+import java.util.IdentityHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 import java.util.TreeSet;
 import java.util.function.Predicate;
 import java.util.jar.JarEntry;
@@ -24,6 +32,7 @@ import java.util.regex.Pattern;
 import java.util.stream.Stream;
 
 import org.graalvm.nativeimage.hosted.Feature;
+import org.graalvm.nativeimage.hosted.RuntimeClassInitialization;
 import org.graalvm.nativeimage.hosted.RuntimeProxyCreation;
 import org.graalvm.nativeimage.hosted.RuntimeReflection;
 import org.graalvm.nativeimage.hosted.RuntimeResourceAccess;
@@ -45,7 +54,13 @@ import it.codingduck.dssnative.engine.TlSnapshotFile;
  *       annotations name ({@code W3CDomHandler}, the standard {@code XmlAdapter}s) are instantiated
  *       reflectively.</li>
  *   <li><b>BouncyCastle provider</b>: the provider constructor loads its {@code $Mappings} classes by name, and
- *       JCA instantiates every service implementation by class name.</li>
+ *       JCA instantiates every service implementation by class name. The provider is also <em>installed</em> in
+ *       {@link Security} at build time ({@link #duringSetup}): Native Image verifies JCE providers (the ones
+ *       {@code Cipher}, {@code KEM}, {@code Mac}, ... may use) in the image builder and keys the results by
+ *       provider <em>instance</em>, so a provider created at run time, as DSS's {@code DSSSecurityProvider} does,
+ *       fails that check. It went unnoticed until JDK 25.0.5 (GraalVM 25.5), whose TLS 1.3 hybrid key exchange
+ *       calls {@code KEM.getInstance("ML-KEM")}, which consults every installed provider, BouncyCastle included:
+ *       every TLS handshake then failed. {@code DssEngine} hands this build-time instance to DSS.</li>
  *   <li><b>Apache Santuario (xmlsec)</b>: signature algorithms, canonicalizers, transforms and resolvers are
  *       instantiated reflectively from the algorithm URI found in the XML being verified (trusted lists, here).
  *       The test lists use one algorithm; real national lists use several (RSA, RSA-PSS, ECDSA, ...).</li>
@@ -84,10 +99,92 @@ public final class DssFeature implements Feature {
     private static final List<String> RESOURCE_BUNDLES = List.of("dss-messages");
 
     private final List<String> report = new ArrayList<>();
+    /** The BouncyCastle provider instance the image carries; null when BouncyCastle is not on the class path. */
+    private Provider bouncyCastle;
 
     @Override
     public String getDescription() {
         return "Registers DSS's JAXB models, BouncyCastle provider services and DSS resources";
+    }
+
+    /**
+     * Installs BouncyCastle in {@link Security} before Native Image's own security feature takes its snapshot
+     * of the installed providers (in its {@code beforeAnalysis}, which runs before this feature's). The image's
+     * provider list then holds a BouncyCastle instance verified at build time, as it does the JDK's providers.
+     */
+    @Override
+    public void duringSetup(DuringSetupAccess access) {
+        Class<?> providerClass = access.findClassByName(BC_PROVIDER);
+        if (providerClass == null) {
+            return;
+        }
+        Provider provider;
+        try {
+            provider = (Provider) providerClass.getConstructor().newInstance();
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException("cannot instantiate " + BC_PROVIDER + " at build time", e);
+        }
+        Provider installed = Security.getProvider(provider.getName());
+        if (installed == null) {
+            Security.addProvider(provider);
+            installed = provider;
+        }
+        bouncyCastle = installed;
+        // The instance ends up in the image heap, and every object stored there must be of a class initialized
+        // at build time: the provider's own, and those of the objects reachable from it (its key-info
+        // converters, ASN.1 constants, configuration; 58 classes in BC 1.86), plus the static state of each.
+        Set<Class<?>> classes = new LinkedHashSet<>();
+        collectHeapClasses(bouncyCastle, Collections.newSetFromMap(new IdentityHashMap<>()), classes);
+        RuntimeClassInitialization.initializeAtBuildTime(classes.toArray(new Class<?>[0]));
+        report.add("BouncyCastle classes initialized at build time (objects reachable from the provider): "
+                + classes.size());
+    }
+
+    /**
+     * The BouncyCastle classes of the objects reachable from {@code o}: through the instance fields of
+     * BouncyCastle objects, the static fields of their classes (in the image heap once the class is initialized
+     * at build time), and the elements of arrays, maps and collections. Objects of other classes are not entered:
+     * the JDK's are initialized at build time already, and the provider's services hold only strings.
+     */
+    private static void collectHeapClasses(Object o, Set<Object> seen, Set<Class<?>> classes) {
+        if (o == null || !seen.add(o)) {
+            return;
+        }
+        Class<?> c = o.getClass();
+        if (c.isArray()) {
+            if (!c.getComponentType().isPrimitive()) {
+                for (Object e : (Object[]) o) {
+                    collectHeapClasses(e, seen, classes);
+                }
+            }
+            return;
+        }
+        if (c.getName().startsWith("org.bouncycastle.")) {
+            for (Class<?> k = c; k != null && k.getName().startsWith("org.bouncycastle."); k = k.getSuperclass()) {
+                boolean statics = classes.add(k);
+                for (Field f : k.getDeclaredFields()) {
+                    if (f.getType().isPrimitive() || (Modifier.isStatic(f.getModifiers()) && !statics)) {
+                        continue;
+                    }
+                    try {
+                        f.setAccessible(true);
+                        collectHeapClasses(f.get(Modifier.isStatic(f.getModifiers()) ? null : o), seen, classes);
+                    } catch (ReflectiveOperationException | RuntimeException e) {
+                        throw new IllegalStateException("cannot read " + f + " at build time", e);
+                    }
+                }
+            }
+        }
+        if (o instanceof Map<?, ?> map) {
+            for (Map.Entry<?, ?> e : map.entrySet()) {
+                collectHeapClasses(e.getKey(), seen, classes);
+                collectHeapClasses(e.getValue(), seen, classes);
+            }
+        } else if (o instanceof Collection<?> collection) {
+            for (Object e : collection) {
+                collectHeapClasses(e, seen, classes);
+            }
+        }
     }
 
     @Override
@@ -147,11 +244,10 @@ public final class DssFeature implements Feature {
     }
 
     private void registerBouncyCastle(BeforeAnalysisAccess access, List<String> entries) {
-        Class<?> providerClass = access.findClassByName(BC_PROVIDER);
-        if (providerClass == null) {
+        if (bouncyCastle == null) {
             return;
         }
-        registerFully(providerClass);
+        registerFully(bouncyCastle.getClass());
         int mappings = 0;
         for (String entry : entries) {
             if (BC_MAPPINGS.matcher(entry).matches()) {
@@ -162,15 +258,8 @@ public final class DssFeature implements Feature {
                 }
             }
         }
-        // A throw-away instance in the image builder, only to read the list of service implementation classes.
-        Provider provider;
-        try {
-            provider = (Provider) providerClass.getConstructor().newInstance();
-        } catch (ReflectiveOperationException e) {
-            throw new IllegalStateException("cannot instantiate " + BC_PROVIDER + " at build time", e);
-        }
         TreeSet<String> serviceClasses = new TreeSet<>();
-        for (Provider.Service service : provider.getServices()) {
+        for (Provider.Service service : bouncyCastle.getServices()) {
             serviceClasses.add(service.getClassName());
         }
         int services = 0;
