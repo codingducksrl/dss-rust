@@ -17,7 +17,9 @@ import java.security.cert.X509Certificate;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
+import java.util.ArrayList;
 import java.util.Base64;
+import java.util.List;
 
 import eu.europa.esig.dss.enumerations.EncryptionAlgorithm;
 import eu.europa.esig.dss.model.DSSDocument;
@@ -36,7 +38,8 @@ import it.codingduck.dssnative.testsupport.TestPki.Entity;
 /**
  * Builds a signed synthetic EU LOTL (TSL v6) pointing at two national TLs, "IT" (listing the test root CA and
  * TSA) and "DE" (listing an unrelated CA), and serves them through {@link FakeHttp}. Generated per test run so
- * the lists never expire in the repository.
+ * the lists never expire in the repository. Optionally a chain of pivot LOTLs ({@link #withPivots}) moves the
+ * LOTL signature to keys the OJ keystore does not hold, as the EU did with its pivots 172, 191, 226 and later.
  */
 public final class SyntheticTrustedLists {
 
@@ -66,6 +69,13 @@ public final class SyntheticTrustedLists {
     private String lotlUrl = LOTL_URL;
     private String itUrl = IT_TL_URL;
     private String deUrl = DE_TL_URL;
+    private int version = 6;
+    private Instant itCaWithdrawnSince;
+    private Entity deCa = Entity.OTHER_CA;
+    /** The LOTL signers announced by the pivots, oldest first; empty: no pivot, the OJ signer signs the LOTL. */
+    private List<ListSigner> pivotSigners = List.of();
+    /** Who signs the oldest pivot; null: the LOTL signer of the OJ keystore, as in a genuine chain. */
+    private ListSigner firstPivotSigner;
 
     public SyntheticTrustedLists(TestPki pki, int sequenceNumber) {
         this.pki = pki;
@@ -93,11 +103,58 @@ public final class SyntheticTrustedLists {
         return this;
     }
 
-    /** Registers LOTL and TLs on {@code http}; each request returns the same signed bytes. */
+    /** Writes this {@code TSLVersionIdentifier} into the LOTL and the TLs (default 6; 5 is the other real one). */
+    public SyntheticTrustedLists withVersion(int version) {
+        this.version = version;
+        return this;
+    }
+
+    /**
+     * Gives the IT CA/QC service a status history: granted since 2020, <em>withdrawn</em> since {@code when}.
+     * With {@code use_sunset_date} the root CA is then a trust anchor only up to {@code when}.
+     */
+    public SyntheticTrustedLists withItCaWithdrawnSince(Instant when) {
+        this.itCaWithdrawnSince = when;
+        return this;
+    }
+
+    /** The CA the DE list lists (default {@link Entity#OTHER_CA}); null for a DE list with no CA service. */
+    public SyntheticTrustedLists withDeCa(Entity ca) {
+        this.deCa = ca;
+        return this;
+    }
+
+    /**
+     * Publishes a pivot chain announcing {@code signers}, oldest first. Pivot {@code i} (1-based, at
+     * {@link #pivotUrl(int)}) is a LOTL whose LOTL pointer announces {@code signers[i-1]} as the LOTL signer; it is
+     * signed by the signer pivot {@code i-1} announced, and pivot 1 by the OJ keystore's LOTL signer. The LOTL itself
+     * is then signed by the last of {@code signers}, announces it, and lists the pivots (newest first) before the
+     * OJ URL in its SchemeInformationURI, which is where DSS finds them (ETSI TS 119 615: the URIs ending in .xml).
+     */
+    public SyntheticTrustedLists withPivots(ListSigner... signers) {
+        this.pivotSigners = List.of(signers);
+        return this;
+    }
+
+    /** Signs the oldest pivot with {@code signer} instead of the OJ keystore's LOTL signer: a forged chain. */
+    public SyntheticTrustedLists withFirstPivotSignedBy(ListSigner signer) {
+        this.firstPivotSigner = signer;
+        return this;
+    }
+
+    /** Where pivot {@code i} (1 = the oldest) is published: next to the LOTL, named like the EU's pivots. */
+    public String pivotUrl(int i) {
+        return lotlUrl.substring(0, lotlUrl.lastIndexOf('/') + 1) + "tl-pivot-" + i + "-mp.xml";
+    }
+
+    /** Registers LOTL, pivots and TLs on {@code http}; each request returns the same signed bytes. */
     public void serveOn(FakeHttp http) {
         http.route(lotlUrl, lotl());
+        for (int i = 1; i <= pivotSigners.size(); i++) {
+            http.route(pivotUrl(i), pivot(i));
+        }
         http.route(itUrl, tl("IT", Entity.ROOT_CA, Entity.TSA));
-        http.route(deUrl, tl("DE", Entity.OTHER_CA, null));
+        http.route(deUrl, tl("DE", deCa, null));
     }
 
     /** Writes a PKCS#12 trust store holding the LOTL signer, standing in for the OJ keystore. */
@@ -116,20 +173,45 @@ public final class SyntheticTrustedLists {
         }
     }
 
+    /** The LOTL, signed by its current signer: the OJ keystore's, or the one the newest pivot announces. */
     public byte[] lotl() {
-        return lotlSignedBy(Entity.LOTL_SIGNER);
+        return sign(lotlDocument(pivotSigners.size(), currentLotlSigner().cert()), currentLotlSigner());
     }
 
-    /** The LOTL signed by {@code signer}; anything but the LOTL signer is absent from the OJ keystore. */
+    /**
+     * The LOTL signed by {@code signer}, whatever signer it announces; anything but the LOTL signer is absent from
+     * the OJ keystore.
+     */
     public byte[] lotlSignedBy(Entity signer) {
+        return sign(lotlDocument(pivotSigners.size(), currentLotlSigner().cert()), ListSigner.of(pki, signer));
+    }
+
+    /** Pivot {@code i} (1 = the oldest) of the chain set with {@link #withPivots}. */
+    public byte[] pivot(int i) {
+        ListSigner signedBy = i > 1 ? pivotSigners.get(i - 2)
+                : firstPivotSigner != null ? firstPivotSigner : ListSigner.of(pki, Entity.LOTL_SIGNER);
+        return sign(lotlDocument(i - 1, pivotSigners.get(i - 1).cert()), signedBy);
+    }
+
+    private ListSigner currentLotlSigner() {
+        return pivotSigners.isEmpty() ? ListSigner.of(pki, Entity.LOTL_SIGNER) : pivotSigners.get(pivotSigners.size() - 1);
+    }
+
+    /** A LOTL announcing {@code lotlSigner}, preceded by {@code olderPivots} pivots (named newest first). */
+    private String lotlDocument(int olderPivots, X509Certificate lotlSigner) {
+        List<String> schemeUris = new ArrayList<>();
+        for (int i = olderPivots; i >= 1; i--) {
+            schemeUris.add(pivotUrl(i));
+        }
+        schemeUris.add(OJ_URL);
         String body = schemeInformation(LOTL_TYPE, "EU", "European Commission (dss-native TEST)",
                 "http://uri.etsi.org/TrstSvc/TrustedList/StatusDetn/EUlistofthelists",
                 "http://uri.etsi.org/TrstSvc/TrustedList/schemerules/EUlistofthelists",
-                pointer(lotlUrl, pki.x509(Entity.LOTL_SIGNER), LOTL_TYPE, "EU")
+                pointer(lotlUrl, lotlSigner, LOTL_TYPE, "EU")
                         + pointer(itUrl, nationalSigner.cert(), GENERIC, "IT")
                         + pointer(deUrl, nationalSigner.cert(), GENERIC, "DE"),
-                lotlUrl);
-        return sign(document(body, ""), ListSigner.of(pki, signer));
+                lotlUrl, schemeUris);
+        return document(body, "");
     }
 
     public byte[] tl(String territory, Entity ca, Entity tsa) {
@@ -142,11 +224,15 @@ public final class SyntheticTrustedLists {
     }
 
     private byte[] tlSignedBy(String territory, Entity ca, Entity tsa, ListSigner signer) {
-        String services = service("http://uri.etsi.org/TrstSvc/Svctype/CA/QC", "Test CA/QC", ca);
-        if (tsa != null) {
-            services += service("http://uri.etsi.org/TrstSvc/Svctype/TSA/QTST", "Test QTSA", tsa);
+        String services = "";
+        if (ca != null) {
+            Instant withdrawn = territory.equals("IT") ? itCaWithdrawnSince : null;
+            services += service("http://uri.etsi.org/TrstSvc/Svctype/CA/QC", "Test CA/QC", ca, withdrawn);
         }
-        String tsp = "<tsl:TrustServiceProviderList><tsl:TrustServiceProvider><tsl:TSPInformation>"
+        if (tsa != null) {
+            services += service("http://uri.etsi.org/TrstSvc/Svctype/TSA/QTST", "Test QTSA", tsa, null);
+        }
+        String tsp = services.isEmpty() ? "" : "<tsl:TrustServiceProviderList><tsl:TrustServiceProvider><tsl:TSPInformation>"
                 + "<tsl:TSPName><tsl:Name xml:lang=\"en\">dss-native Test TSP " + territory + "</tsl:Name></tsl:TSPName>"
                 + address(territory)
                 + "<tsl:TSPInformationURI><tsl:URI xml:lang=\"en\">https://tsp.dss-native.test/</tsl:URI></tsl:TSPInformationURI>"
@@ -155,22 +241,27 @@ public final class SyntheticTrustedLists {
         String body = schemeInformation(GENERIC, territory, "Supervisory body " + territory + " (dss-native TEST)",
                 "http://uri.etsi.org/TrstSvc/TrustedList/StatusDetn/EUappropriate",
                 "http://uri.etsi.org/TrstSvc/TrustedList/schemerules/EUcommon",
-                pointer(lotlUrl, pki.x509(Entity.LOTL_SIGNER), LOTL_TYPE, "EU"),
-                territory.equals("IT") ? itUrl : deUrl);
+                pointer(lotlUrl, currentLotlSigner().cert(), LOTL_TYPE, "EU"),
+                territory.equals("IT") ? itUrl : deUrl, List.of(OJ_URL));
         return sign(document(body, tsp), signer);
     }
 
     private String schemeInformation(String type, String territory, String operator, String statusApproach,
-                                     String communityRules, String pointers, String distributionPoint) {
+                                     String communityRules, String pointers, String distributionPoint,
+                                     List<String> schemeInformationUris) {
+        StringBuilder uris = new StringBuilder();
+        for (String uri : schemeInformationUris) {
+            uris.append("<tsl:URI xml:lang=\"en\">").append(uri).append("</tsl:URI>");
+        }
         Instant now = Instant.now().truncatedTo(ChronoUnit.SECONDS);
         return "<tsl:SchemeInformation>"
-                + "<tsl:TSLVersionIdentifier>6</tsl:TSLVersionIdentifier>"
+                + "<tsl:TSLVersionIdentifier>" + version + "</tsl:TSLVersionIdentifier>"
                 + "<tsl:TSLSequenceNumber>" + sequenceNumber + "</tsl:TSLSequenceNumber>"
                 + "<tsl:TSLType>" + type + "</tsl:TSLType>"
                 + "<tsl:SchemeOperatorName><tsl:Name xml:lang=\"en\">" + operator + "</tsl:Name></tsl:SchemeOperatorName>"
                 + "<tsl:SchemeOperatorAddress>" + addressBody(territory) + "</tsl:SchemeOperatorAddress>"
                 + "<tsl:SchemeName><tsl:Name xml:lang=\"en\">" + territory + ":dss-native synthetic trusted list</tsl:Name></tsl:SchemeName>"
-                + "<tsl:SchemeInformationURI><tsl:URI xml:lang=\"en\">" + OJ_URL + "</tsl:URI></tsl:SchemeInformationURI>"
+                + "<tsl:SchemeInformationURI>" + uris + "</tsl:SchemeInformationURI>"
                 + "<tsl:StatusDeterminationApproach>" + statusApproach + "</tsl:StatusDeterminationApproach>"
                 + "<tsl:SchemeTypeCommunityRules><tsl:URI xml:lang=\"en\">" + communityRules + "</tsl:URI></tsl:SchemeTypeCommunityRules>"
                 + "<tsl:SchemeTerritory>" + territory + "</tsl:SchemeTerritory>"
@@ -209,15 +300,30 @@ public final class SyntheticTrustedLists {
                 + "</tsl:OtherTSLPointer>";
     }
 
-    private String service(String type, String name, Entity cert) {
-        return "<tsl:TSPService><tsl:ServiceInformation>"
-                + "<tsl:ServiceTypeIdentifier>" + type + "</tsl:ServiceTypeIdentifier>"
+    private static final String GRANTED = "http://uri.etsi.org/TrstSvc/TrustedList/Svcstatus/granted";
+    private static final String WITHDRAWN = "http://uri.etsi.org/TrstSvc/TrustedList/Svcstatus/withdrawn";
+    private static final String GRANTED_SINCE = "2020-01-01T00:00:00Z";
+
+    /** A service granted since 2020; when {@code withdrawnSince} is set, withdrawn since then with that history. */
+    private String service(String type, String name, Entity cert, Instant withdrawnSince) {
+        String identity = "<tsl:ServiceTypeIdentifier>" + type + "</tsl:ServiceTypeIdentifier>"
                 + "<tsl:ServiceName><tsl:Name xml:lang=\"en\">" + name + "</tsl:Name></tsl:ServiceName>"
                 + "<tsl:ServiceDigitalIdentity><tsl:DigitalId><tsl:X509Certificate>" + b64(pki.x509(cert))
-                + "</tsl:X509Certificate></tsl:DigitalId></tsl:ServiceDigitalIdentity>"
-                + "<tsl:ServiceStatus>http://uri.etsi.org/TrstSvc/TrustedList/Svcstatus/granted</tsl:ServiceStatus>"
-                + "<tsl:StatusStartingTime>2020-01-01T00:00:00Z</tsl:StatusStartingTime>"
-                + "</tsl:ServiceInformation></tsl:TSPService>";
+                + "</tsl:X509Certificate></tsl:DigitalId></tsl:ServiceDigitalIdentity>";
+        if (withdrawnSince == null) {
+            return "<tsl:TSPService><tsl:ServiceInformation>" + identity
+                    + "<tsl:ServiceStatus>" + GRANTED + "</tsl:ServiceStatus>"
+                    + "<tsl:StatusStartingTime>" + GRANTED_SINCE + "</tsl:StatusStartingTime>"
+                    + "</tsl:ServiceInformation></tsl:TSPService>";
+        }
+        return "<tsl:TSPService><tsl:ServiceInformation>" + identity
+                + "<tsl:ServiceStatus>" + WITHDRAWN + "</tsl:ServiceStatus>"
+                + "<tsl:StatusStartingTime>" + withdrawnSince.truncatedTo(ChronoUnit.SECONDS) + "</tsl:StatusStartingTime>"
+                + "</tsl:ServiceInformation>"
+                + "<tsl:ServiceHistory><tsl:ServiceHistoryInstance>" + identity
+                + "<tsl:ServiceStatus>" + GRANTED + "</tsl:ServiceStatus>"
+                + "<tsl:StatusStartingTime>" + GRANTED_SINCE + "</tsl:StatusStartingTime>"
+                + "</tsl:ServiceHistoryInstance></tsl:ServiceHistory></tsl:TSPService>";
     }
 
     private static String document(String schemeInformation, String providers) {

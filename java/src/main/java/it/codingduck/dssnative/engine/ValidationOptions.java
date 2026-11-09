@@ -45,6 +45,11 @@ public final class ValidationOptions {
         this.unwrapNested = unwrapNested;
     }
 
+    /** These options with {@code detachedContents} replaced by a copy of {@code contents}. */
+    public ValidationOptions withDetachedContents(List<DSSDocument> contents) {
+        return new ValidationOptions(reports, List.copyOf(contents), validationTime, filename, unwrapNested);
+    }
+
     public static ValidationOptions fromJson(String json) {
         Map<String, Object> map;
         try {

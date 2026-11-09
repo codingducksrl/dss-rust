@@ -5,7 +5,9 @@
 //!
 //! Every `dss_*` function takes the calling thread's `graal_isolatethread_t*`, returns a malloc'd UTF-8 JSON
 //! string (or NULL when out of memory) that must be released with `dss_free`. `dss_extend` and `dss_sign_complete`
-//! also hand back a document through their out-parameters, released with `dss_free` too. See
+//! also hand back a document through their out-parameters, released with `dss_free` too. `dss_validate_with_contents`
+//! takes the signed content of a detached signature as binary buffers (three parallel arrays of `count` entries:
+//! names, contents and lengths; bindgen renders the header's `const char**` as `*mut *const c_char`). See
 //! `docs/native-library.md`.
 //! The safe API is in the `dss` crate.
 
@@ -30,6 +32,25 @@ mod tests {
             let json = CStr::from_ptr(v).to_str().unwrap().to_owned();
             dss_free(thread, v);
             assert!(json.contains("\"ok\":true"), "{json}");
+
+            // dss_validate_with_contents is bound: its count check runs before anything needs dss_init.
+            let r = dss_validate_with_contents(
+                thread,
+                ptr::null(),
+                0,
+                2000,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null(),
+                ptr::null(),
+            );
+            assert!(!r.is_null());
+            let json = CStr::from_ptr(r).to_str().unwrap().to_owned();
+            dss_free(thread, r);
+            assert!(
+                json.contains("\"INVALID_ARGUMENT\"") && json.contains("count larger than 1024"),
+                "{json}"
+            );
             assert_eq!(graal_tear_down_isolate(thread), 0);
         }
     }

@@ -7,6 +7,7 @@ package it.codingduck.dssnative.testsupport;
 
 import java.security.GeneralSecurityException;
 import java.security.PrivateKey;
+import java.security.SecureRandom;
 import java.security.Signature;
 
 import eu.europa.esig.dss.enumerations.DigestAlgorithm;
@@ -28,9 +29,26 @@ public final class Signing {
 
     /** Through BouncyCastle, which knows DSS's JCE names for every scheme (e.g. RSASSA-PSS with MGF1). */
     public static SignatureValue sign(ToBeSigned tbs, SignatureAlgorithm algorithm, PrivateKey key) {
+        return sign(tbs, algorithm, key, null);
+    }
+
+    /**
+     * As {@link #sign(ToBeSigned, DigestAlgorithm, PrivateKey)}, drawing randomized schemes' randomness (the ECDSA
+     * nonce, the PSS salt) from {@code random}: a seeded one makes the signature reproducible.
+     */
+    public static SignatureValue sign(ToBeSigned tbs, DigestAlgorithm digest, PrivateKey key, SecureRandom random) {
+        return sign(tbs, SignatureAlgorithm.getAlgorithm(EncryptionAlgorithm.forKey(key), digest), key, random);
+    }
+
+    private static SignatureValue sign(ToBeSigned tbs, SignatureAlgorithm algorithm, PrivateKey key,
+                                       SecureRandom random) {
         try {
             Signature jca = Signature.getInstance(algorithm.getJCEId(), DSSSecurityProvider.getSecurityProvider());
-            jca.initSign(key);
+            if (random != null) {
+                jca.initSign(key, random);
+            } else {
+                jca.initSign(key);
+            }
             jca.update(tbs.getBytes());
             return new SignatureValue(algorithm, jca.sign());
         } catch (GeneralSecurityException e) {

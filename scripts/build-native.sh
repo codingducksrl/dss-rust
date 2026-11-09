@@ -8,15 +8,23 @@
 #   libdssnative.h            dss_* functions        libdssnative_dynamic.h   same, as function-pointer types
 #   graal_isolate.h           isolate/thread API      graal_isolate_dynamic.h
 #   licenses/                 licence texts and notices of everything compiled into the library (LICENSING.md)
+#   sbom/java.cdx.json        CycloneDX SBOM of the jars compiled into the library
 #
 #   scripts/build-native.sh [--with-tests]   (default skips the JVM and native test suites)
 #
-# Requires JAVA_HOME = GraalVM Community Edition 25 (see docs/DECISIONS.md).
+# Requires JAVA_HOME = GraalVM Community Edition, the release java/pom.xml pins (graalvm.sdk.version, the same as
+# scripts/ci/install-graalvm.sh). Another vendor is refused: the library would contain a runtime under a
+# different licence (LICENSING.md). Another CE release is refused in CI (CI=true) and only warned about locally.
 set -euo pipefail
 root="$(cd "$(dirname "$0")/.." && pwd)"
 skip=(-DskipTests)
 [[ "${1:-}" == "--with-tests" ]] && skip=()
+"$root/scripts/ci/check-graalvm.sh" "${JAVA_HOME:?JAVA_HOME must be GraalVM Community Edition}"
 "$JAVA_HOME/bin/native-image" --version | head -1
+t="$root/java/target"
+# The licence folders and SBOM are regenerated on every build: a dependency that was bumped or dropped must not
+# leave its old notices behind. The dependency plugin skips artifacts it has markers for, so those go too.
+rm -rf "$t/third-party-licenses" "$t/dependency-maven-plugin-markers" "$t/dss-native.cdx.json"
 # ${skip[@]+...}: an empty array is "unbound" under set -u in bash 3.2 (macOS's /bin/bash).
 (cd "$root/java" && ./mvnw -B -Pnative ${skip[@]+"${skip[@]}"} package)
 
@@ -32,7 +40,6 @@ case "$(uname -m)" in
 esac
 out="$root/build/native/$os-$arch"
 rm -rf "$out" && mkdir -p "$out"
-t="$root/java/target"
 cp "$t/libdssnative.$ext" "$t/libdssnative.h" "$t/libdssnative_dynamic.h" \
    "$t/graal_isolate.h" "$t/graal_isolate_dynamic.h" "$out/"
 # native-image also writes JDK AWT libraries (libawt*, libfontmanager, ...) next to the image, because PDFBox
@@ -42,24 +49,8 @@ cp "$t/libdssnative.$ext" "$t/libdssnative.h" "$t/libdssnative_dynamic.h" \
 # - the JDK's libawt keeps process-wide state and crashes when several isolates load it at the same time.
 # scripts/smoke-test-c.sh runs from this directory, including isolates that validate PDFs concurrently.
 
-# Licences of what the library contains, to ship with it (LICENSING.md, "Release packages"): the LGPL (dss-native
-# and DSS), notices for DSS, PT Serif and stax2-api, every other third-party jar's own LICENSE/NOTICE files
-# (collected by the pom's third-party-licenses execution), and GraalVM CE's licences, JDK notices included.
-lic="$out/licenses"
-mkdir -p "$lic/java" "$lic/graalvm"
-cp "$root/LICENSE" "$lic/LGPL-2.1.txt"
-cp "$root/third-party/dss.txt" "$root/third-party/pt-serif.txt" "$lic/"
-for jar in "$t/third-party-licenses"/*/; do
-  name="$(basename "$jar")"
-  mkdir -p "$lic/java/$name"
-  cp "$jar"META-INF/* "$lic/java/$name/"
-done
-cp "$root/third-party/stax2-api.txt" "$lic/java/stax2-api-"*/
-cp -L "$JAVA_HOME/LICENSE.txt" "$JAVA_HOME/THIRD_PARTY_LICENSE.txt" "$lic/graalvm/"
-# `release` records the source commit of every GraalVM component (SOURCE=...): the corresponding source of the
-# GPL-licensed runtime in the library.
-cp -L "$JAVA_HOME/release" "$lic/graalvm/"
-cp -RL "$JAVA_HOME/legal" "$lic/graalvm/legal"
+# Licences of what the library contains, and its SBOM, to ship with it (LICENSING.md, "Release packages").
+"$root/scripts/ci/collect-native-licenses.sh" "$t" "$out" "$JAVA_HOME"
 
 echo "Native library in $out:"
 ls -la "$out"

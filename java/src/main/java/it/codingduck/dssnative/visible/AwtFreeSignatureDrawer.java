@@ -12,12 +12,15 @@ import java.io.InputStream;
 import java.util.ArrayList;
 import java.util.List;
 
+import org.apache.pdfbox.cos.COSArray;
 import org.apache.pdfbox.cos.COSDictionary;
 import org.apache.pdfbox.cos.COSName;
+import org.apache.pdfbox.cos.COSStream;
 import org.apache.pdfbox.pdmodel.PDDocument;
 import org.apache.pdfbox.pdmodel.PDDocumentCatalog;
 import org.apache.pdfbox.pdmodel.PDPage;
 import org.apache.pdfbox.pdmodel.PDPageContentStream;
+import org.apache.pdfbox.pdmodel.PDResources;
 import org.apache.pdfbox.pdmodel.common.PDRectangle;
 import org.apache.pdfbox.pdmodel.common.PDStream;
 import org.apache.pdfbox.pdmodel.font.PDFont;
@@ -72,11 +75,14 @@ final class AwtFreeSignatureDrawer implements PdfBoxSignatureDrawer, SignatureFi
     static final float MIN_FONT_SIZE = 3;
     private static final float SHRINK = 0.95f;
     private static final String DEFAULT_FONT = "/fonts/PTSerifRegular.ttf";
+    private static final COSName DEFAULT_RGB = COSName.getPDFName("DefaultRGB");
 
     private final Appearance appearance;
     private final Placement placement;
     private PDDocument document;
     private SignatureOptions signatureOptions;
+    /** Whether the PDF has output intents, none of them RGB: then DeviceRGB needs a DefaultRGB for PDF/A. */
+    private boolean defaultRgbNeeded;
 
     AwtFreeSignatureDrawer(VisibleImageParameters parameters) {
         this.appearance = parameters.appearance();
@@ -87,6 +93,7 @@ final class AwtFreeSignatureDrawer implements PdfBoxSignatureDrawer, SignatureFi
     public void init(SignatureImageParameters parameters, PDDocument document, SignatureOptions signatureOptions) {
         this.document = document;
         this.signatureOptions = signatureOptions;
+        this.defaultRgbNeeded = hasOnlyNonRgbOutputIntents(document);
         addOutputIntentIfMissing(document);
     }
 
@@ -124,6 +131,9 @@ final class AwtFreeSignatureDrawer implements PdfBoxSignatureDrawer, SignatureFi
                     PdfBoxUtils.createSignatureAppearanceDictionary(template, rectangle);
             widget.setAppearance(appearanceDictionary);
             PDAppearanceStream stream = appearanceDictionary.getNormalAppearance().getAppearanceStream();
+            if (defaultRgbNeeded) {
+                addDefaultRgb(template, stream);
+            }
 
             // The font goes into the template, which subsets it when saved: only the glyphs drawn are embedded.
             PDFont font = appearance.text() != null ? loadFont(template) : null;
@@ -144,7 +154,14 @@ final class AwtFreeSignatureDrawer implements PdfBoxSignatureDrawer, SignatureFi
                 }
             }
             ByteArrayOutputStream out = new ByteArrayOutputStream();
-            template.save(out);
+            try {
+                template.save(out); // subsets and embeds the font
+            } catch (IOException | RuntimeException e) {
+                if (appearance.font() != null) {
+                    throw fontError(e);
+                }
+                throw e;
+            }
             signatureOptions.setVisualSignature(new ByteArrayInputStream(out.toByteArray()));
         }
     }
@@ -221,21 +238,30 @@ final class AwtFreeSignatureDrawer implements PdfBoxSignatureDrawer, SignatureFi
         return new Box(area.x + (area.w - w) / 2, area.y + (area.h - h) / 2, w, h);
     }
 
-    /** The largest size up to {@code font_size} at which the text, wrapped at spaces, fits {@code area}. */
+    /**
+     * The largest size up to {@code font_size} at which the text, wrapped at spaces, fits {@code area}. Each
+     * word is measured once; a size step then costs one pass over the words, and stops as soon as the lines
+     * overflow the box.
+     */
     private FittedText fit(PDFont font, Box area) throws IOException {
         float[] vertical = verticalMetrics(font);
         float ascent = vertical[0];
         float descent = vertical[1];
         String[] paragraphs = appearance.text().split("\n", -1);
+        List<Paragraph> measured = new ArrayList<>(paragraphs.length);
         for (String paragraph : paragraphs) {
             checkGlyphs(font, paragraph);
+            measured.add(Paragraph.measure(font, paragraph));
         }
         for (float size = appearance.fontSize(); ; size = Math.max(MIN_FONT_SIZE, size * SHRINK)) {
             float lineHeight = (ascent - descent) / 1000 * size;
             List<String> lines = new ArrayList<>();
             boolean fits = true;
-            for (String paragraph : paragraphs) {
-                fits &= wrap(font, size, area.w, paragraph, lines);
+            for (Paragraph paragraph : measured) {
+                fits = paragraph.wrap(size, area.w, lines, lineHeight, area.h);
+                if (!fits) {
+                    break;
+                }
             }
             if (fits && lines.size() * lineHeight <= area.h) {
                 float block = lines.size() * lineHeight;
@@ -250,26 +276,78 @@ final class AwtFreeSignatureDrawer implements PdfBoxSignatureDrawer, SignatureFi
         }
     }
 
-    /** Greedy wrapping at spaces into {@code out}; false if a single word is wider than {@code width}. */
-    private static boolean wrap(PDFont font, float size, float width, String paragraph, List<String> out)
-            throws IOException {
-        String[] words = paragraph.split(" ", -1);
-        StringBuilder line = new StringBuilder(words[0]);
-        boolean fits = textWidth(font, size, words[0]) <= width;
-        for (int i = 1; i < words.length; i++) {
-            String candidate = line + " " + words[i];
-            if (textWidth(font, size, candidate) <= width) {
-                line.setLength(0);
-                line.append(candidate);
-            } else {
-                out.add(line.toString());
-                line.setLength(0);
-                line.append(words[i]);
-                fits &= textWidth(font, size, words[i]) <= width;
+    /**
+     * A paragraph's words with the advance of each of their glyphs, in 1000-unit font space, in the order
+     * {@link PDFont#getStringWidth} adds them: summing them again in that order gives the width PDFBox would
+     * compute for the whole line, to the bit, so the wrapping is the same as measuring each candidate line.
+     */
+    private record Paragraph(String[] words, float[][] glyphs, float[] space) {
+
+        static Paragraph measure(PDFont font, String paragraph) throws IOException {
+            String[] words = paragraph.split(" ", -1);
+            float[][] glyphs = new float[words.length][];
+            for (int i = 0; i < words.length; i++) {
+                glyphs[i] = advances(font, words[i]);
             }
+            // The space is measured only when the paragraph has one: a font without a space glyph (an icon or
+            // symbol font) can still show a single word, and checkGlyphs has already refused a text it cannot.
+            float[] space = words.length > 1 ? advances(font, " ") : new float[0];
+            return new Paragraph(words, glyphs, space);
         }
-        out.add(line.toString());
-        return fits;
+
+        private static float[] advances(PDFont font, String s) throws IOException {
+            byte[] bytes = font.encode(s);
+            ByteArrayInputStream in = new ByteArrayInputStream(bytes);
+            float[] out = new float[bytes.length];
+            int n = 0;
+            while (in.available() > 0) {
+                out[n++] = font.getWidth(font.readCode(in));
+            }
+            float[] exact = new float[n];
+            System.arraycopy(out, 0, exact, 0, n);
+            return exact;
+        }
+
+        /**
+         * Greedy wrapping at spaces into {@code out}; false if a single word is wider than {@code width}, or
+         * as soon as the lines so far are taller than {@code maxHeight} (the text does not fit at this size,
+         * so there is no point wrapping the rest).
+         */
+        boolean wrap(float size, float width, List<String> out, float lineHeight, float maxHeight) {
+            StringBuilder line = new StringBuilder(words[0]);
+            float running = sum(0, glyphs[0]);
+            boolean fits = scaled(running, size) <= width;
+            for (int i = 1; i < words.length && fits; i++) {
+                float candidate = sum(sum(running, space), glyphs[i]);
+                if (scaled(candidate, size) <= width) {
+                    running = candidate;
+                    line.append(' ').append(words[i]);
+                } else {
+                    out.add(line.toString());
+                    if (out.size() * lineHeight > maxHeight) {
+                        return false;
+                    }
+                    line.setLength(0);
+                    line.append(words[i]);
+                    running = sum(0, glyphs[i]);
+                    fits = scaled(running, size) <= width;
+                }
+            }
+            out.add(line.toString());
+            return fits;
+        }
+
+        private static float sum(float from, float[] advances) {
+            float width = from;
+            for (float advance : advances) {
+                width += advance;
+            }
+            return width;
+        }
+
+        private static float scaled(float width, float size) {
+            return width / 1000 * size;
+        }
     }
 
     private static float textWidth(PDFont font, float size, String s) throws IOException {
@@ -346,7 +424,18 @@ final class AwtFreeSignatureDrawer implements PdfBoxSignatureDrawer, SignatureFi
         try (InputStream in = appearance.font() != null ? new ByteArrayInputStream(appearance.font())
                 : defaultFont()) {
             return PDType0Font.load(template, in, true);
+        } catch (IOException | RuntimeException e) {
+            if (appearance.font() != null) {
+                throw fontError(e);
+            }
+            throw e;
         }
+    }
+
+    /** The caller's font failed where the option check could not foresee it: still the caller's problem. */
+    private static DssError fontError(Exception e) {
+        return new DssError(DssError.Code.INVALID_ARGUMENT, "options: pades.visible: 'font' cannot be embedded: "
+                + e.getMessage(), e);
     }
 
     /** DSS's default font for visible signatures, PT Serif (SIL Open Font License), from the dss-pades jar. */
@@ -375,9 +464,6 @@ final class AwtFreeSignatureDrawer implements PdfBoxSignatureDrawer, SignatureFi
             return;
         }
         try {
-            PDStream profile = new PDStream(document, new ByteArrayInputStream(SrgbProfile.bytes()),
-                    COSName.FLATE_DECODE);
-            profile.getCOSObject().setInt(COSName.N, 3);
             COSDictionary intent = new COSDictionary();
             intent.setItem(COSName.TYPE, COSName.OUTPUT_INTENT);
             intent.setItem(COSName.S, COSName.GTS_PDFA1);
@@ -385,10 +471,57 @@ final class AwtFreeSignatureDrawer implements PdfBoxSignatureDrawer, SignatureFi
             intent.setString(COSName.OUTPUT_CONDITION_IDENTIFIER, "sRGB");
             intent.setString(COSName.INFO, "sRGB IEC61966-2.1");
             intent.setString(COSName.REGISTRY_NAME, "http://www.color.org");
-            intent.setItem(COSName.DEST_OUTPUT_PROFILE, profile);
+            intent.setItem(COSName.DEST_OUTPUT_PROFILE, srgbProfile(document));
             catalog.addOutputIntent(new PDOutputIntent(intent));
         } catch (IOException e) {
             LOG.warn("Cannot add an sRGB output intent: {}", e.getMessage());
         }
+    }
+
+    /**
+     * PDF/A (ISO 19005-2, 6.2.4.3) allows DeviceRGB only with an RGB output intent or a DefaultRGB colour space
+     * in the content's resources. A PDF whose output intents are all for another colour space (a CMYK print
+     * profile, say) keeps them, and the appearance gets a DefaultRGB of sRGB so that its coloured text and
+     * images stay conforming. DeviceGray needs no more than an output intent of any kind.
+     */
+    private static boolean hasOnlyNonRgbOutputIntents(PDDocument document) {
+        List<PDOutputIntent> intents = document.getDocumentCatalog().getOutputIntents();
+        if (intents.isEmpty()) {
+            return false;
+        }
+        for (PDOutputIntent intent : intents) {
+            COSStream profile = intent.getDestOutputIntent();
+            if (profile != null && profile.getInt(COSName.N) == 3) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static void addDefaultRgb(PDDocument template, PDAppearanceStream stream) throws IOException {
+        PDResources resources = stream.getResources();
+        if (resources == null) {
+            resources = new PDResources();
+            stream.setResources(resources);
+        }
+        COSDictionary colorSpaces = resources.getCOSObject().getCOSDictionary(COSName.COLORSPACE);
+        if (colorSpaces == null) {
+            colorSpaces = new COSDictionary();
+            resources.getCOSObject().setItem(COSName.COLORSPACE, colorSpaces);
+        }
+        PDStream profile = srgbProfile(template);
+        profile.getCOSObject().setItem(COSName.ALTERNATE, COSName.DEVICERGB);
+        COSArray iccBased = new COSArray();
+        iccBased.add(COSName.ICCBASED);
+        iccBased.add(profile.getCOSObject());
+        colorSpaces.setItem(DEFAULT_RGB, iccBased);
+    }
+
+    /** Our sRGB ICC profile as a stream of {@code document}, with its component count. */
+    private static PDStream srgbProfile(PDDocument document) throws IOException {
+        PDStream profile = new PDStream(document, new ByteArrayInputStream(SrgbProfile.bytes()),
+                COSName.FLATE_DECODE);
+        profile.getCOSObject().setInt(COSName.N, 3);
+        return profile;
     }
 }

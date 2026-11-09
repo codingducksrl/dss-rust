@@ -1,7 +1,13 @@
 PT Serif Regular (fonts/PTSerifRegular.ttf in the DSS dss-pades jar), compiled into libdssnative as the
 default font of visible signatures.
 
-Copyright © 2010 ParaType Ltd.
+Copyright (c) 2010, ParaType Ltd. (http://www.paratype.com/public),
+with Reserved Font Names "PT Sans", "PT Serif" and "ParaType".
+
+(The font file's own copyright string, name ID 0: "Copyright © 2010 ParaType Ltd. All rights reserved.")
+
+The font file compiled into the library is unmodified. Under the OFL, a Modified Version may not use the Reserved
+Font Names above.
 
 This Font Software is licensed under the SIL Open Font License, Version 1.1.
 This license is copied below, and is also available with a FAQ at:

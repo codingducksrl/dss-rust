@@ -12,11 +12,12 @@ set -euo pipefail
 root="$(cd "$(dirname "$0")/.." && pwd)"
 synthetic="$root/rust/target/synthetic-tl"
 rm -rf "$synthetic"
+# exec.args is split again by exec-maven-plugin, on whitespace outside quotes: each argument is quoted.
 (cd "$root/java" && ./mvnw -q -B test-compile exec:java -Dexec.classpathScope=test \
   -Dexec.mainClass=it.codingduck.dssnative.testsupport.SyntheticCacheSeeder \
-  -Dexec.args="$synthetic" -Ddssnative.repoRoot="$root")
+  -Dexec.args="\"$synthetic\"" -Ddssnative.repoRoot="$root")
 export DSS_TEST_SYNTHETIC_DIR="$synthetic"
 skip=(--skip online_)
 [[ "${1:-}" == "--online" ]] && skip=()
 cd "$root/rust"
-cargo test --workspace --all-features -- --include-ignored ${skip[@]+"${skip[@]}"}
+cargo test --locked --workspace --all-features -- --include-ignored ${skip[@]+"${skip[@]}"}

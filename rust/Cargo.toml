@@ -7,7 +7,7 @@ version = "0.0.0-dev"
 edition = "2024"
 rust-version = "1.99"
 license = "LGPL-2.1-or-later"
-repository = "https://github.com/codingduck/dss-native"
+repository = "https://github.com/codingducksrl/dss-rust"
 publish = false
 
 [workspace.dependencies]

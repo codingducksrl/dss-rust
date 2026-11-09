@@ -6,11 +6,11 @@
 package it.codingduck.dssnative.engine;
 
 import java.io.IOException;
-import java.security.MessageDigest;
+import java.security.PublicKey;
+import java.security.interfaces.ECPublicKey;
+import java.security.interfaces.RSAPublicKey;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
-import java.util.Base64;
-import java.util.Collection;
 import java.util.Date;
 import java.util.List;
 import java.util.TimeZone;
@@ -18,43 +18,37 @@ import java.util.TimeZone;
 import org.bouncycastle.asn1.ASN1Encodable;
 import org.bouncycastle.asn1.ASN1Encoding;
 import org.bouncycastle.asn1.ASN1Integer;
-import org.bouncycastle.asn1.ASN1OctetString;
 import org.bouncycastle.asn1.ASN1Primitive;
 import org.bouncycastle.asn1.ASN1Sequence;
 import org.bouncycastle.asn1.DEROctetString;
 import org.bouncycastle.asn1.DERSequence;
 import org.bouncycastle.asn1.DERTaggedObject;
-import org.bouncycastle.asn1.cms.Attribute;
-import org.bouncycastle.asn1.cms.AttributeTable;
 import org.bouncycastle.asn1.cms.CMSObjectIdentifiers;
 import org.bouncycastle.asn1.cms.ContentInfo;
 import org.bouncycastle.asn1.cms.SignedData;
-import org.bouncycastle.asn1.pkcs.PKCSObjectIdentifiers;
-import org.bouncycastle.cert.X509CertificateHolder;
-import org.bouncycastle.cms.SignerInformation;
 
+import eu.europa.esig.dss.alert.exception.AlertException;
 import eu.europa.esig.dss.cades.CAdESSignatureParameters;
 import eu.europa.esig.dss.cades.signature.CAdESService;
-import eu.europa.esig.dss.cades.validation.CAdESSignature;
-import eu.europa.esig.dss.cms.CMS;
-import eu.europa.esig.dss.cms.CMSUtils;
-import eu.europa.esig.dss.enumerations.DigestAlgorithm;
 import eu.europa.esig.dss.enumerations.EncryptionAlgorithm;
 import eu.europa.esig.dss.enumerations.SignatureAlgorithm;
 import eu.europa.esig.dss.enumerations.SignaturePackaging;
 import eu.europa.esig.dss.model.DSSDocument;
-import eu.europa.esig.dss.model.DigestDocument;
 import eu.europa.esig.dss.model.InMemoryDocument;
 import eu.europa.esig.dss.model.SignatureValue;
 import eu.europa.esig.dss.model.ToBeSigned;
-import eu.europa.esig.dss.model.signature.SignatureCryptographicVerification;
 import eu.europa.esig.dss.model.x509.CertificateToken;
 import eu.europa.esig.dss.pades.PAdESSignatureParameters;
 import eu.europa.esig.dss.pades.signature.PAdESService;
+import eu.europa.esig.dss.pades.signature.PAdESSignatureRequirementsChecker;
 import eu.europa.esig.dss.pades.signature.PAdESWithExternalCMSService;
+import eu.europa.esig.dss.pades.validation.PDFDocumentAnalyzer;
 import eu.europa.esig.dss.pdf.IPdfObjFactory;
 import eu.europa.esig.dss.spi.DSSUtils;
+import eu.europa.esig.dss.spi.exception.IllegalInputException;
+import eu.europa.esig.dss.spi.signature.AdvancedSignature;
 import eu.europa.esig.dss.spi.validation.CertificateVerifier;
+import eu.europa.esig.dss.spi.x509.BaselineBCertificateSelector;
 import eu.europa.esig.dss.spi.x509.tsp.TSPSource;
 
 import it.codingduck.dssnative.engine.SigningOptions.Format;
@@ -72,10 +66,20 @@ import it.codingduck.dssnative.visible.VisibleImageParameters;
  * <p>For PAdES this relies on DSS preparing the same PDF twice: the signature dictionary, the {@code /Contents}
  * placeholder and the document ID follow from the options, the signing time and the document name alone, never
  * from the host (the signing date is written in UTC, whatever the host's time zone).
+ *
+ * <p>Everything {@code complete} would refuse that can be known before the external signature is spent is
+ * refused at {@code prepare}: an unsuitable signing certificate (when given), a {@code pades.content_size} the
+ * CMS DSS builds cannot fit, and existing PDF signatures that DSS would reject when it extends the document
+ * (checked whenever the requested level may extend it; see {@link #assertExistingSignaturesExtendable}).
  */
 final class ExternalSigning {
 
     private static final TimeZone UTC = TimeZone.getTimeZone("UTC");
+    /**
+     * Lower bound for the CMS framing DSS adds around the signed attributes, the signature value and the
+     * certificates (ContentInfo, SignedData, SignerInfo, algorithm identifiers, tags and lengths).
+     */
+    private static final int CMS_FRAMING_MIN = 64;
 
     private final CertificateVerifier verifier;
     private final TSPSource tspSource;
@@ -111,20 +115,31 @@ final class ExternalSigning {
         Instant time = options.signingTime != null ? options.signingTime
                 : Instant.now().truncatedTo(ChronoUnit.SECONDS);
         SigningOptions o = options.withSigningTime(time);
-        DigestAlgorithm digestAlgorithm = o.digestAlgorithm;
-        DSSDocument doc = document(document, o, format);
-        VisibleImageParameters visible = format == Format.PADES ? visible(document, o) : null;
-
-        if (o.mode == Mode.CMS) {
-            byte[] digest = format == Format.PADES
-                    ? externalCmsService().getMessageDigest(doc, padesParameters(o, visible)).getValue()
-                    : DSSUtils.digest(digestAlgorithm, document);
-            return new PreparedSignature(format, digestAlgorithm, digest, null, time);
+        if (o.signingCertificate != null) {
+            SigningCertificateCheck.assertSuitable(o.signingCertificate, time);
         }
-        ToBeSigned tbs = format == Format.PADES
-                ? padesService().getDataToSign(doc, padesParameters(o, visible))
-                : cadesService().getDataToSign(doc, cadesParameters(o));
-        return new PreparedSignature(format, digestAlgorithm, DSSUtils.digest(digestAlgorithm, tbs.getBytes()),
+        DSSDocument doc = document(document, o, format);
+
+        if (format == Format.PADES) {
+            PAdESSignatureParameters parameters = padesParameters(o, visible(document, o));
+            assertExistingSignaturesExtendable(doc, o, parameters);
+            if (o.mode == Mode.CMS) {
+                byte[] digest = externalCmsService().getMessageDigest(doc, parameters).getValue();
+                return new PreparedSignature(format, o.digestAlgorithm, digest, null, time);
+            }
+            ToBeSigned tbs = padesService().getDataToSign(doc, parameters);
+            assertContentSizeFits(o, parameters, tbs);
+            return prepared(format, o, tbs, time);
+        }
+        if (o.mode == Mode.CMS) {
+            return new PreparedSignature(format, o.digestAlgorithm, DSSUtils.digest(o.digestAlgorithm, document), null,
+                    time);
+        }
+        return prepared(format, o, cadesService().getDataToSign(doc, cadesParameters(o)), time);
+    }
+
+    private static PreparedSignature prepared(Format format, SigningOptions o, ToBeSigned tbs, Instant time) {
+        return new PreparedSignature(format, o.digestAlgorithm, DSSUtils.digest(o.digestAlgorithm, tbs.getBytes()),
                 tbs.getBytes(), time);
     }
 
@@ -133,6 +148,9 @@ final class ExternalSigning {
         if (o.signingTime == null && (format == Format.PADES || o.mode == Mode.SIGNATURE_VALUE)) {
             throw new DssError(DssError.Code.INVALID_ARGUMENT,
                     "options: 'signing_time' is required to complete: pass the one prepare returned");
+        }
+        if (o.signingCertificate != null) {
+            SigningCertificateCheck.assertSuitable(o.signingCertificate, o.signingTime);
         }
         DSSDocument doc = document(document, o, format);
         VisibleImageParameters visible = format == Format.PADES ? visible(document, o) : null;
@@ -144,8 +162,9 @@ final class ExternalSigning {
         if (format == Format.PADES) {
             PAdESService service = padesService();
             PAdESSignatureParameters parameters = padesParameters(o, visible);
-            assertSignatureValueValid(service.isValidSignatureValue(service.getDataToSign(doc, parameters), value,
-                    o.signingCertificate));
+            ToBeSigned tbs = service.getDataToSign(doc, parameters);
+            assertContentSizeFits(o, parameters, tbs);
+            assertSignatureValueValid(service.isValidSignatureValue(tbs, value, o.signingCertificate));
             DSSDocument signed = service.signDocument(doc, parameters, value);
             return new SigningResult(DSSUtils.toByteArray(signed), format, o.level.pades, "ENVELOPED");
         }
@@ -163,32 +182,39 @@ final class ExternalSigning {
     private SigningResult padesFromCms(DSSDocument doc, SigningOptions o, VisibleImageParameters visible,
                                        byte[] external) {
         PAdESWithExternalCMSService service = externalCmsService();
-        byte[] digest = service.getMessageDigest(doc, padesParameters(o, visible)).getValue();
-        CMS cms = checkedCms(external, Format.PADES, o, digest);
-        byte[] der = cms.getDEREncoded();
+        // One parameters object for both calls: DSS keeps the prepared PDF in it, so signing splices the CMS into
+        // the placeholder instead of preparing the PDF a second time.
+        PAdESSignatureParameters parameters = padesParameters(o, visible);
+        byte[] digest = service.getMessageDigest(doc, parameters).getValue();
+        ExternalCms.Checked checked = ExternalCms.check(external, Format.PADES, o, digest);
+        SigningCertificateCheck.assertSuitable(checked.signerCertificate(), o.signingTime);
+        byte[] der = checked.cms().getDEREncoded();
         int reserved = o.contentSizeOrDefault();
         if (der.length > reserved) {
             throw new DssError(DssError.Code.SIGNING_FAILED, "the CMS is " + der.length + " bytes, more than the "
                     + reserved + " reserved for it in the PDF: prepare and sign again with a larger "
                     + "'pades.content_size'");
         }
-        boolean timestamped = hasSignatureTimestamp(cms);
         // DSS embeds the CMS, then extends unless the level is B, or T and the CMS already has its timestamp.
-        DSSDocument signed = service.signDocument(doc, padesParameters(o, visible), new InMemoryDocument(der));
-        return new SigningResult(DSSUtils.toByteArray(signed), Format.PADES, reached(o.level, timestamped).pades,
-                "ENVELOPED");
+        DSSDocument signed = service.signDocument(doc, parameters, new InMemoryDocument(der));
+        return new SigningResult(DSSUtils.toByteArray(signed), Format.PADES,
+                reached(o.level, checked.timestamped()).pades, "ENVELOPED");
     }
 
     private SigningResult cadesFromCms(DSSDocument doc, byte[] content, SigningOptions o, byte[] external) {
-        CMS cms = checkedCms(external, Format.CADES, o, DSSUtils.digest(o.digestAlgorithm, content));
+        ExternalCms.Checked checked = ExternalCms.check(external, Format.CADES, o,
+                DSSUtils.digest(o.digestAlgorithm, content));
+        // For CAdES the CMS carries the time it claims (the signing-time attribute); the options' signing_time is
+        // not part of the digest, so the certificate is checked at the time the signature itself states.
+        SigningCertificateCheck.assertSuitable(checked.signerCertificate(), checked.claimedSigningTime());
         Packaging packaging = o.packaging != null ? o.packaging : Packaging.DETACHED;
-        byte[] der = cms.getDEREncoded();
+        byte[] der = checked.cms().getDEREncoded();
         if (packaging == Packaging.ENVELOPING) {
             der = encapsulate(der, content);
         }
         DSSDocument signed = new InMemoryDocument(der, doc.getName() + (packaging == Packaging.ENVELOPING ? ".p7m"
                 : ".p7s"));
-        boolean timestamped = hasSignatureTimestamp(cms);
+        boolean timestamped = checked.timestamped();
         if (o.level == Level.LT || o.level == Level.LTA || (o.level == Level.T && !timestamped)) {
             CAdESSignatureParameters parameters = new CAdESSignatureParameters();
             parameters.setSignatureLevel(o.level.cades);
@@ -207,102 +233,6 @@ final class ExternalSigning {
     /** At B, an external CMS that already carries a signature timestamp is a T signature. */
     private static Level reached(Level requested, boolean timestamped) {
         return requested == Level.B && timestamped ? Level.T : requested;
-    }
-
-    /**
-     * Parses what the external signer returned and checks it is a baseline-B CMS for this {@code digest}, with
-     * reasons a caller can act on. DSS's own checker only logs them.
-     */
-    private static CMS checkedCms(byte[] external, Format format, SigningOptions o, byte[] digest) {
-        InputNormalizer.Normalized input = InputNormalizer.normalize(external);
-        if (input.type() != InputNormalizer.Type.CMS) {
-            throw failed("mode \"cms\" expects a CMS SignedData from the external signer (DER, BER, base64 or "
-                    + "PEM), and this is not one; for a bare signature value use mode \"signature_value\"");
-        }
-        CMS cms;
-        try {
-            cms = CMSUtils.parseToCMS(input.bytes());
-        } catch (RuntimeException e) {
-            throw failed("the external CMS cannot be parsed: " + e.getMessage());
-        }
-        Collection<SignerInformation> signers = cms.getSignerInfos().getSigners();
-        if (signers.size() != 1) {
-            throw failed("the CMS has " + signers.size() + " signers; exactly one is expected");
-        }
-        if (!cms.isDetachedSignature()) {
-            throw failed("the CMS encapsulates content; the external signer must return a detached CMS (it "
-                    + "signs a digest, the content stays here)");
-        }
-        SignerInformation signer = signers.iterator().next();
-        if (!o.digestAlgorithm.getOid().equals(signer.getDigestAlgOID())) {
-            DigestAlgorithm used = digestAlgorithmOrNull(signer.getDigestAlgOID());
-            throw failed("the CMS uses digest algorithm " + (used != null ? used.getName() : signer.getDigestAlgOID())
-                    + ", the options say " + o.digestAlgorithm.getName());
-        }
-
-        AttributeTable signed = signer.getSignedAttributes();
-        if (signed == null) {
-            throw failed("the CMS has no signed attributes");
-        }
-        Attribute contentType = signed.get(PKCSObjectIdentifiers.pkcs_9_at_contentType);
-        if (contentType == null || !CMSObjectIdentifiers.data.equals(contentType.getAttrValues().getObjectAt(0))) {
-            throw failed("the CMS has no content-type attribute with value id-data, which baseline signatures "
-                    + "require");
-        }
-        Attribute messageDigest = signed.get(PKCSObjectIdentifiers.pkcs_9_at_messageDigest);
-        if (messageDigest == null) {
-            throw failed("the CMS has no message-digest attribute");
-        }
-        byte[] signedDigest = ASN1OctetString.getInstance(messageDigest.getAttrValues().getObjectAt(0)).getOctets();
-        if (!MessageDigest.isEqual(signedDigest, digest)) {
-            throw failed("the CMS signs the digest " + Base64.getEncoder().encodeToString(signedDigest)
-                    + ", not this document's " + Base64.getEncoder().encodeToString(digest) + ": prepare and complete "
-                    + "need the same document and options, including signing_time");
-        }
-        if (signed.get(PKCSObjectIdentifiers.id_aa_signingCertificateV2) == null
-                && signed.get(PKCSObjectIdentifiers.id_aa_signingCertificate) == null) {
-            throw failed("the CMS has no signing-certificate-v2 attribute, which baseline signatures require");
-        }
-        boolean signingTime = signed.get(PKCSObjectIdentifiers.pkcs_9_at_signingTime) != null;
-        if (format == Format.PADES && signingTime) {
-            throw failed("the CMS has a signing-time attribute, which PAdES does not allow (the signing time is the "
-                    + "PDF's /M entry): the external signer must leave it out");
-        }
-        if (format == Format.CADES && !signingTime) {
-            throw failed("the CMS has no signing-time attribute, which CAdES-BASELINE-B requires");
-        }
-
-        CertificateToken signerCertificate = signerCertificate(cms, signer);
-        if (o.signingCertificate != null && !o.signingCertificate.equals(signerCertificate)) {
-            throw failed("the CMS is signed by " + signerCertificate.getSubject().getRFC2253() + ", not by the "
-                    + "signing_certificate given (" + o.signingCertificate.getSubject().getRFC2253() + ")");
-        }
-        CAdESSignature signature = new CAdESSignature(cms, signer);
-        signature.setDetachedContents(List.of(new DigestDocument(o.digestAlgorithm, digest)));
-        SignatureCryptographicVerification verification = signature.getSignatureCryptographicVerification();
-        if (!verification.isSignatureValid()) {
-            throw failed("the CMS signature does not verify with its signer's certificate: "
-                    + verification.getErrorMessage());
-        }
-        return cms;
-    }
-
-    private static CertificateToken signerCertificate(CMS cms, SignerInformation signer) {
-        @SuppressWarnings("unchecked")
-        Collection<X509CertificateHolder> matches = cms.getCertificates().getMatches(signer.getSID());
-        if (matches.isEmpty()) {
-            throw failed("the CMS does not contain its signer's certificate");
-        }
-        try {
-            return DSSUtils.loadCertificate(matches.iterator().next().getEncoded());
-        } catch (IOException e) {
-            throw failed("the signer's certificate in the CMS cannot be read: " + e.getMessage());
-        }
-    }
-
-    private static boolean hasSignatureTimestamp(CMS cms) {
-        AttributeTable unsigned = cms.getSignerInfos().getSigners().iterator().next().getUnsignedAttributes();
-        return unsigned != null && unsigned.get(PKCSObjectIdentifiers.id_aa_signatureTimeStampToken) != null;
     }
 
     /** A detached DER CMS with {@code content} put into encapContentInfo: the signature covers it unchanged. */
@@ -368,6 +298,108 @@ final class ExternalSigning {
             throw failed("the signature value does not verify with the signing certificate over this document's "
                     + "data to be signed: prepare and complete need the same document and options, including "
                     + "signing_time, and the signer must use the signing certificate's key");
+        }
+    }
+
+    /**
+     * In mode {@code "signature_value"} DSS builds the CMS and checks only when it writes it that it fits
+     * {@code pades.content_size}; by then the external signature is spent. This estimates a lower bound of the
+     * CMS size (the signed attributes, the signature value, the certificates DSS will include and the CMS framing)
+     * and refuses a size that cannot fit. The signature timestamp of level T is not part of the estimate: its
+     * size depends on the TSA.
+     */
+    private void assertContentSizeFits(SigningOptions o, PAdESSignatureParameters parameters, ToBeSigned tbs) {
+        int reserved = o.contentSizeOrDefault();
+        int atLeast = estimatedCmsSize(o, parameters, tbs);
+        if (atLeast > reserved) {
+            throw new DssError(DssError.Code.INVALID_ARGUMENT, "options: 'pades.content_size' is " + reserved
+                    + " bytes, but the CMS DSS builds around the signature value will be at least " + atLeast
+                    + " (signed attributes, signature value and certificates"
+                    + (o.level != Level.B ? ", before the timestamp" : "") + "): raise it, or leave the default "
+                    + SigningOptions.DEFAULT_CONTENT_SIZE);
+        }
+    }
+
+    private int estimatedCmsSize(SigningOptions o, PAdESSignatureParameters parameters, ToBeSigned tbs) {
+        // The certificates DSS embeds, selected as its CMS builder selects them: the chain from the signing
+        // certificate up to the first trust anchor (left out under the B-level trust anchor policy, with whatever is
+        // above it); a certificate of the chain that is not on that path is left out too.
+        List<CertificateToken> included = new BaselineBCertificateSelector(parameters.getSigningCertificate(),
+                parameters.getCertificateChain())
+                .setTrustedCertificateSource(verifier.getTrustedCertSources())
+                .setTrustAnchorBPPolicy(parameters.bLevel().isTrustAnchorBPPolicy())
+                .getCertificates();
+        int size = tbs.getBytes().length + minimalSignatureValueSize(o.signingCertificate.getPublicKey())
+                + CMS_FRAMING_MIN;
+        for (CertificateToken c : included) {
+            size += c.getEncoded().length;
+        }
+        return size;
+    }
+
+    /** A lower bound of the signature value's length: exact for RSA, small for ECDSA (whose DER length varies). */
+    private static int minimalSignatureValueSize(PublicKey key) {
+        if (key instanceof RSAPublicKey rsa) {
+            return (rsa.getModulus().bitLength() + 7) / 8;
+        }
+        if (key instanceof ECPublicKey ec) {
+            return 2 * ((ec.getParams().getCurve().getField().getFieldSize() + 7) / 8 - 1);
+        }
+        return 0;
+    }
+
+    // ------------------------------------------------------------------ the PDF's other signatures
+
+    /**
+     * When DSS extends the PDF after embedding the new signature (mode {@code "cms"} from T up, where it adds the
+     * document timestamp the new signature needs; mode {@code "signature_value"} from LT up) it re-checks every
+     * signature already in the PDF and refuses a broken one, one whose certificate had expired without proof of
+     * time, or one already at a higher level. {@code prepare} runs the same checks (with the same verifier and
+     * alerts, without fetching revocation data) whenever the requested level may extend the document, so that no
+     * external signature is spent on a document {@code complete} would refuse.
+     *
+     * <p>Which checks DSS runs depends on whether the PDF needs a document timestamp first. It does when any
+     * signature in it lacks a T profile: {@code PAdESLevelBaselineT} then asserts that T is the highest level, that
+     * the signatures verify and that their signing certificates are valid. Otherwise {@code PAdESLevelBaselineLT}
+     * asserts that LT is the highest level (at LT) and that the signatures verify; their chains it checks with
+     * revocation data, which {@code prepare} does not fetch, so that stays with {@code complete}. In mode
+     * {@code "cms"} the new signature is itself at B when DSS extends, so the PDF always needs the document
+     * timestamp and the first set applies; at T this is checked even when the signer's CMS turns out to carry its
+     * own timestamp (then {@code complete} does not extend at all), the one case where {@code prepare} is stricter.
+     * In mode {@code "signature_value"} the new CMS brings its own signature timestamp, so the existing signatures
+     * decide, as they do at {@code complete}.
+     */
+    private void assertExistingSignaturesExtendable(DSSDocument doc, SigningOptions o,
+                                                    PAdESSignatureParameters parameters) {
+        boolean extended = o.level == Level.LT || o.level == Level.LTA || (o.level == Level.T && o.mode == Mode.CMS);
+        if (!extended) {
+            return;
+        }
+        PDFDocumentAnalyzer analyzer = new PDFDocumentAnalyzer(doc);
+        analyzer.setPdfObjFactory(pdfObjFactory);
+        analyzer.setCertificateVerifier(verifier);
+        List<AdvancedSignature> signatures = analyzer.getSignatures();
+        if (signatures.isEmpty()) {
+            return;
+        }
+        boolean documentTimestampFirst = o.mode == Mode.CMS || signatures.stream().anyMatch(s -> !s.hasTProfile());
+        PAdESSignatureRequirementsChecker checker = new PAdESSignatureRequirementsChecker(verifier, parameters);
+        try {
+            if (documentTimestampFirst) {
+                // What PAdESLevelBaselineT asserts before it adds the document timestamp.
+                checker.assertExtendToTLevelPossible(signatures);
+                checker.assertSignaturesValid(signatures);
+                checker.assertSigningCertificateIsValid(signatures);
+            } else {
+                // What PAdESLevelBaselineLT asserts without one, short of the chain validity (revocation data).
+                if (o.level == Level.LT) {
+                    checker.assertExtendToLTLevelPossible(signatures);
+                }
+                checker.assertSignaturesValid(signatures);
+            }
+        } catch (AlertException | IllegalInputException e) {
+            throw failed("the PDF's existing signatures cannot be extended to " + o.level + " together with the new "
+                    + "one, so complete would refuse it: " + e.getMessage());
         }
     }
 
@@ -446,14 +478,6 @@ final class ExternalSigning {
         CAdESService service = new CAdESService(verifier);
         service.setTspSource(tspSource);
         return service;
-    }
-
-    private static DigestAlgorithm digestAlgorithmOrNull(String oid) {
-        try {
-            return DigestAlgorithm.forOID(oid);
-        } catch (RuntimeException e) {
-            return null;
-        }
     }
 
     private static DssError failed(String message) {

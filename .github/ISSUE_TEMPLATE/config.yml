@@ -1,0 +1,10 @@
+# SPDX-FileCopyrightText: 2026 Coding Duck
+# SPDX-License-Identifier: LGPL-2.1-or-later
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/codingducksrl/dss-rust/security/advisories/new
+    about: Privately, never in a public issue (SECURITY.md).
+  - name: A problem in DSS itself
+    url: https://github.com/esig/dss
+    about: dss-native uses DSS unmodified; validation rules and DSS's own messages belong upstream.

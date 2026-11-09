@@ -15,6 +15,7 @@ import org.apache.pdfbox.cos.COSDictionary;
 import org.apache.pdfbox.pdmodel.PDDocument;
 import org.apache.pdfbox.pdmodel.PDPage;
 import org.apache.pdfbox.pdmodel.common.PDRectangle;
+import org.apache.pdfbox.pdmodel.encryption.InvalidPasswordException;
 import org.apache.pdfbox.pdmodel.interactive.annotation.PDAnnotation;
 import org.apache.pdfbox.pdmodel.interactive.annotation.PDAnnotationWidget;
 import org.apache.pdfbox.pdmodel.interactive.form.PDAcroForm;
@@ -30,7 +31,7 @@ import it.codingduck.dssnative.engine.DssError;
  *
  * @param page     1-based
  * @param field    the existing field to fill, or null for a new one
- * @param rotation the page's {@code /Rotate}, normalised to 0, 90, 180 or 270
+ * @param rotation the page's {@code /Rotate}, normalised to 0, 90, 180 or 270 (0 for a {@code NoRotate} field)
  */
 public record Placement(int page, String field, float llx, float lly, float urx, float ury, int rotation) {
 
@@ -57,18 +58,19 @@ public record Placement(int page, String field, float llx, float lly, float urx,
     static Placement resolve(byte[] pdf, Appearance a) {
         try (PDDocument document = Loader.loadPDF(pdf)) {
             return a.field() != null ? existingField(document, a.field()) : newField(document, a);
+        } catch (InvalidPasswordException e) {
+            throw new DssError(DssError.Code.UNSUPPORTED_DOCUMENT, "the PDF is encrypted with a user password, "
+                    + "which is not supported: remove the password before signing it", e);
         } catch (IOException e) {
             throw new DssError(DssError.Code.UNSUPPORTED_DOCUMENT, "cannot read the PDF: " + e.getMessage(), e);
         }
     }
 
     private static Placement newField(PDDocument document, Appearance a) {
-        int pages = document.getNumberOfPages();
-        if (a.page() < 1 || a.page() > pages) {
-            throw invalid("page " + a.page() + " does not exist: the document has " + pages + " page"
-                    + (pages == 1 ? "" : "s"));
+        PDPage page = pageOrNull(document, a.page());
+        if (page == null) {
+            throw missingPage(document, a.page());
         }
-        PDPage page = document.getPage(a.page() - 1);
         int rotation = rotation(page);
         PDRectangle crop = visibleBox(page);
         boolean quarter = rotation == 90 || rotation == 270;
@@ -107,16 +109,68 @@ public record Placement(int page, String field, float llx, float lly, float urx,
             throw invalid("the signature field '" + name + "' has no widget to draw in");
         }
         PDAnnotationWidget widget = widgets.get(0);
-        int page = pageOf(document, widget);
-        if (page < 1) {
+        Located located = locate(document, widget);
+        if (located == null) {
             throw invalid("the signature field '" + name + "' is on no page");
+        }
+        int page = located.number();
+        if (pageOrNull(document, page) == null) {
+            throw missingPage(document, page); // the drawer and DSS reach the page by its index
         }
         PDRectangle r = widget.getRectangle();
         if (r.getWidth() <= 0 || r.getHeight() <= 0) {
             throw invalid("the signature field '" + name + "' has an empty rectangle: it is an invisible field");
         }
+        // PDFBox keeps the widget's flags when it signs the field (it only sets Print), so an appearance drawn
+        // into a Hidden or NoView widget would never be displayed.
+        if (widget.isHidden() || widget.isNoView()) {
+            throw invalid("the signature field '" + name + "' is flagged " + (widget.isHidden() ? "Hidden"
+                    : "NoView") + ": its appearance would not be displayed");
+        }
+        // A NoRotate widget is displayed upright whatever the page's /Rotate, so there is nothing to undo.
+        int rotation = widget.isNoRotate() ? 0 : rotation(located.page());
         return new Placement(page, name, r.getLowerLeftX(), r.getLowerLeftY(), r.getUpperRightX(),
-                r.getUpperRightY(), rotation(document.getPage(page - 1)));
+                r.getUpperRightY(), rotation);
+    }
+
+    /**
+     * The page by its index, the way PDFBox (the drawer and DSS) reaches it, or null when it cannot:
+     * {@link #missingPage} says why.
+     */
+    private static PDPage pageOrNull(PDDocument document, int page) {
+        if (page < 1 || page > document.getNumberOfPages()) {
+            return null;
+        }
+        try {
+            return document.getPage(page - 1);
+        } catch (IllegalStateException | IndexOutOfBoundsException e) {
+            return null;
+        }
+    }
+
+    /**
+     * Why {@code page} cannot be used. {@code getNumberOfPages()} is the page tree's {@code /Count}, which a
+     * damaged PDF may overstate (the page does not exist) or understate (the page is there, but PDFBox does
+     * not look past the count, so neither the drawer nor DSS could reach it); only walking the tree tells.
+     */
+    private static DssError missingPage(PDDocument document, int page) {
+        int pages = countPages(document);
+        if (page >= 1 && page <= pages) {
+            int announced = document.getNumberOfPages();
+            return invalid("page " + page + " cannot be reached: the PDF's page tree announces " + announced
+                    + " page" + (announced == 1 ? "" : "s") + " but holds " + pages + "; repair the PDF before "
+                    + "signing it");
+        }
+        return invalid("page " + page + " does not exist: the document has " + pages + " page"
+                + (pages == 1 ? "" : "s"));
+    }
+
+    private static int countPages(PDDocument document) {
+        int n = 0;
+        for (PDPage ignored : document.getPages()) {
+            n++;
+        }
+        return n;
     }
 
     private static List<String> emptySignatureFields(PDAcroForm acroForm) {
@@ -129,14 +183,21 @@ public record Placement(int page, String field, float llx, float lly, float urx,
         return names;
     }
 
-    /** The widget's page from its {@code /P} entry, else by looking for it among each page's annotations. */
-    private static int pageOf(PDDocument document, PDAnnotationWidget widget) {
+    /** A page found by walking the tree, with its 1-based number. */
+    private record Located(int number, PDPage page) {
+    }
+
+    /**
+     * The widget's page from its {@code /P} entry, else by looking for it among each page's annotations; null
+     * when it is on none.
+     */
+    private static Located locate(PDDocument document, PDAnnotationWidget widget) {
         COSDictionary target = widget.getCOSObject();
         PDPage declared = widget.getPage();
         if (declared != null) {
             int index = document.getPages().indexOf(declared);
             if (index >= 0) {
-                return index + 1;
+                return new Located(index + 1, declared);
             }
         }
         int n = 1;
@@ -144,7 +205,7 @@ public record Placement(int page, String field, float llx, float lly, float urx,
             try {
                 for (PDAnnotation annotation : page.getAnnotations()) {
                     if (annotation.getCOSObject() == target) {
-                        return n;
+                        return new Located(n, page);
                     }
                 }
             } catch (IOException e) {
@@ -152,7 +213,7 @@ public record Placement(int page, String field, float llx, float lly, float urx,
             }
             n++;
         }
-        return -1;
+        return null;
     }
 
     /** What viewers show: the crop box, clipped to the media box. */

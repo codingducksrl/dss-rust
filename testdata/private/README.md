@@ -2,7 +2,9 @@
 
 Put real signed documents here (`.p7m`, `.pdf`, …) to include them in local and
 differential test runs. Everything in this folder except this README is gitignored:
-real documents usually carry personal data and must never be committed.
+real documents usually carry personal data and must never be committed. `scripts/ci/check-repo.py` fails (in
+CI on every push and pull request) when anything else from this folder is in git's index; install it as a
+pre-commit hook to be stopped before committing: `ln -s ../../scripts/ci/check-repo.py .git/hooks/pre-commit`.
 
 Detached signatures: name the content file the same as the signature without the
 `.p7s` extension (e.g. `contract.pdf` + `contract.pdf.p7s`).

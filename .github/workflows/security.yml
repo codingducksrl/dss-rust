@@ -1,0 +1,100 @@
+# SPDX-FileCopyrightText: 2026 Coding Duck
+# SPDX-License-Identifier: LGPL-2.1-or-later
+#
+# Dependency monitoring (docs/DECISIONS.md, "Dependency monitoring"). The library parses untrusted PDF, CMS and
+# XML, and it is static: scanners of a deployed classpath cannot see what it contains. So, every Monday and on every
+# change to the dependency manifests:
+#
+#   cargo-deny     RustSec advisories, licences, sources and yanked versions of rust/Cargo.lock (rust/deny.toml)
+#   osv-scanner    OSV advisories for rust/Cargo.lock and java/pom.xml, transitive Maven dependencies included
+#   graalvm        weekly only: fails when a newer GraalVM CE release than the pinned one is out. The JDK and its
+#                  CA bundle are compiled into the library, so a JDK security fix reaches users only through a
+#                  rebuild and a release (scripts/ci/install-graalvm.sh and java/pom.xml, then tag)
+#
+# Dependabot (.github/dependabot.yml) proposes the version bumps themselves.
+name: Security
+
+on:
+  schedule:
+    - cron: "17 5 * * 1"
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - rust/Cargo.lock
+      - rust/**/Cargo.toml
+      - rust/deny.toml
+      - java/pom.xml
+      - .github/workflows/security.yml
+  pull_request:
+    paths:
+      - rust/Cargo.lock
+      - rust/**/Cargo.toml
+      - rust/deny.toml
+      - java/pom.xml
+      - .github/workflows/security.yml
+
+permissions:
+  contents: read
+
+jobs:
+  cargo-deny:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install cargo-deny 0.20.2 (SHA-256 pinned)
+        run: |
+          file=cargo-deny-0.20.2-x86_64-unknown-linux-musl.tar.gz
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/$file" "https://github.com/EmbarkStudios/cargo-deny/releases/download/0.20.2/$file"
+          echo "9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f  $RUNNER_TEMP/$file" | sha256sum -c
+          tar -xzf "$RUNNER_TEMP/$file" -C "$RUNNER_TEMP"
+          mkdir -p "$RUNNER_TEMP/bin" && mv "$RUNNER_TEMP"/cargo-deny-0.20.2-x86_64-unknown-linux-musl/cargo-deny "$RUNNER_TEMP/bin/"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+      - name: cargo deny check
+        working-directory: rust
+        run: cargo deny --locked check
+
+  osv-scanner:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install osv-scanner 2.7.0 (SHA-256 pinned)
+        run: |
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/osv-scanner" \
+            https://github.com/google/osv-scanner/releases/download/v2.7.0/osv-scanner_linux_amd64
+          echo "160c6253e2922e9e0a6a9771c5c4c40a4b3c6090b34a3cdd5e80c96cc2e4218b  $RUNNER_TEMP/osv-scanner" | sha256sum -c
+          chmod +x "$RUNNER_TEMP/osv-scanner"
+
+      - name: Scan Cargo.lock and pom.xml
+        run: |
+          "$RUNNER_TEMP/osv-scanner" scan source --lockfile rust/Cargo.lock --lockfile java/pom.xml
+
+  graalvm:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Pinned GraalVM CE is the latest release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          pinned="$(sed -n 's/^release="\(.*\)"$/\1/p' scripts/ci/install-graalvm.sh)"
+          latest="$(gh api repos/graalvm/graalvm-ce-builds/releases/latest --jq .tag_name)"
+          echo "pinned $pinned, latest $latest"
+          if [[ "$latest" != "$pinned" ]]; then
+            echo "::error::GraalVM CE $latest is out, the library embeds $pinned's JDK and CA bundle: bump scripts/ci/install-graalvm.sh and graalvm.sdk.version in java/pom.xml, then release"
+            exit 1
+          fi

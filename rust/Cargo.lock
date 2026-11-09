@@ -257,11 +257,13 @@ name = "dss-server"
 version = "0.0.0-dev"
 dependencies = [
  "axum",
- "base64",
  "clap",
  "dss",
  "dss-sys",
+ "http-body",
  "http-body-util",
+ "hyper",
+ "hyper-util",
  "serde_json",
  "tokio",
  "tower",

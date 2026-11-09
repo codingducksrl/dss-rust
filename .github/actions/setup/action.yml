@@ -7,18 +7,31 @@ inputs:
   platform:
     description: linux-x64, linux-aarch64 or macos-aarch64
     required: true
+  release:
+    description: >-
+      true for a release build: the Maven repository is restored only from an exact cache hit (same pom), never
+      from an older cache by prefix
+    required: false
+    default: "false"
 runs:
   using: composite
   steps:
-    - name: Cache GraalVM CE
+    # Only the downloaded tarball is cached; install-graalvm.sh checks its SHA-256 on every run and extracts it
+    # afresh. The key hashes the script, so changing the pin there changes the key.
+    - name: Cache GraalVM CE download
       uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
-        path: ~/graalvm
-        key: graalvm-ce-25.4.4.1.1-${{ inputs.platform }}
+        path: ~/graalvm/download
+        key: graalvm-ce-${{ inputs.platform }}-${{ hashFiles('scripts/ci/install-graalvm.sh') }}
 
+    # Assigned first, then written: inside `echo "...$(...)"` the script's exit status would be lost and an
+    # empty JAVA_HOME exported.
     - name: Install GraalVM CE
       shell: bash
-      run: echo "JAVA_HOME=$(scripts/ci/install-graalvm.sh "$HOME/graalvm")" >> "$GITHUB_ENV"
+      run: |
+        home="$(scripts/ci/install-graalvm.sh "$HOME/graalvm")"
+        [[ -n "$home" && -x "$home/bin/native-image" ]] || { echo "::error::GraalVM CE installation failed"; exit 1; }
+        echo "JAVA_HOME=$home" >> "$GITHUB_ENV"
 
     # build-essential, zlib1g-dev: native-image's documented Linux prerequisites (it links with -lz).
     # libclang-dev: bindgen (dss-sys). unzip: without it the Maven wrapper fetches the .tar.gz distribution,
@@ -42,8 +55,8 @@ runs:
       uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: ~/.m2/repository
-        key: maven-${{ inputs.platform }}-${{ hashFiles('java/pom.xml', 'java/.mvn/wrapper/maven-wrapper.properties') }}
-        restore-keys: maven-${{ inputs.platform }}-
+        key: maven-${{ inputs.platform }}-${{ hashFiles('java/pom.xml', 'java/.mvn/maven.config', 'java/.mvn/wrapper/maven-wrapper.properties') }}
+        restore-keys: ${{ inputs.release != 'true' && format('maven-{0}-', inputs.platform) || '' }}
 
     - name: Cache Cargo
       uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0

@@ -1,0 +1,43 @@
+# SPDX-FileCopyrightText: 2026 Coding Duck
+# SPDX-License-Identifier: LGPL-2.1-or-later
+#
+# Weekly version-update pull requests for every pinned input (docs/DECISIONS.md, "Dependency monitoring").
+# Security updates come on top, as soon as an advisory is published, once Dependabot alerts are enabled in the
+# repository settings. .github/workflows/checks.yml and security.yml run on each pull request.
+#
+# Not covered here, and checked by .github/workflows/security.yml instead: the GraalVM CE release
+# (scripts/ci/install-graalvm.sh with its SHA-256 values, and graalvm.sdk.version in java/pom.xml, which must
+# move together) and the container images pinned in ci.yml.
+version: 2
+updates:
+  - package-ecosystem: maven
+    directory: /java
+    schedule:
+      interval: weekly
+    groups:
+      maven-plugins:
+        patterns: ["org.apache.maven.plugins:*", "org.codehaus.mojo:*", "org.cyclonedx:*", "org.graalvm.buildtools:*"]
+    ignore:
+      # Bumped together with scripts/ci/install-graalvm.sh (see above).
+      - dependency-name: "org.graalvm.sdk:*"
+
+  - package-ecosystem: cargo
+    directory: /rust
+    schedule:
+      interval: weekly
+    groups:
+      cargo-minor:
+        update-types: [minor, patch]
+
+  - package-ecosystem: github-actions
+    directories: ["/", "/.github/actions/setup"]
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
+
+  - package-ecosystem: docker
+    directory: /docker/dss-server
+    schedule:
+      interval: weekly

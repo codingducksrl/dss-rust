@@ -17,6 +17,10 @@ import java.util.Map;
  *
  * <p>Parsed values map to: object → {@code LinkedHashMap<String,Object>}, array → {@code ArrayList<Object>},
  * string → {@code String}, number → {@code Long} or {@code Double}, true/false → {@code Boolean}, null → {@code null}.
+ *
+ * <p>Strict (RFC 8259): duplicate object keys, numbers with leading zeros or a dangling {@code .} or exponent,
+ * numbers beyond a double's range, signed or non-hex {@code \\u} escapes and lone surrogates are all errors.
+ * Lenient parsing here would let two parsers read one {@code config_json} differently.
  */
 public final class Json {
 
@@ -130,7 +134,12 @@ public final class Json {
                 if (peek() != '"') {
                     throw new ParseException("Expected object key", pos);
                 }
+                int keyAt = pos;
                 String key = readString();
+                if (map.containsKey(key)) {
+                    // Parsers disagree on which duplicate wins; for a security-relevant key that is a hole.
+                    throw new ParseException("Duplicate key '" + key + "'", keyAt);
+                }
                 skipWs();
                 if (peek() != ':') {
                     throw new ParseException("Expected ':'", pos);
@@ -206,15 +215,23 @@ public final class Json {
                         case 'r': sb.append('\r'); break;
                         case 't': sb.append('\t'); break;
                         case 'u':
-                            if (pos + 4 > s.length()) {
-                                throw new ParseException("Bad unicode escape", pos);
+                            char u = readHex4();
+                            if (Character.isHighSurrogate(u)) {
+                                // Only a complete pair is a character; a lone surrogate is not valid text.
+                                if (!(s.startsWith("\\u", pos) && pos + 6 <= s.length())) {
+                                    throw new ParseException("Lone surrogate in unicode escape", pos - 6);
+                                }
+                                pos += 2;
+                                char low = readHex4();
+                                if (!Character.isLowSurrogate(low)) {
+                                    throw new ParseException("Lone surrogate in unicode escape", pos - 12);
+                                }
+                                sb.append(u).append(low);
+                            } else if (Character.isLowSurrogate(u)) {
+                                throw new ParseException("Lone surrogate in unicode escape", pos - 6);
+                            } else {
+                                sb.append(u);
                             }
-                            try {
-                                sb.append((char) Integer.parseInt(s.substring(pos, pos + 4), 16));
-                            } catch (NumberFormatException ex) {
-                                throw new ParseException("Bad unicode escape", pos);
-                            }
-                            pos += 4;
                             break;
                         default:
                             throw new ParseException("Bad escape '\\" + e + "'", pos - 1);
@@ -225,6 +242,23 @@ public final class Json {
                     sb.append(c);
                 }
             }
+        }
+
+        /** Exactly four hex digits at {@code pos} (a sign or anything else is an error), consumed. */
+        private char readHex4() {
+            if (pos + 4 > s.length()) {
+                throw new ParseException("Bad unicode escape", pos);
+            }
+            int value = 0;
+            for (int i = 0; i < 4; i++) {
+                int digit = Character.digit(s.charAt(pos + i), 16);
+                if (digit < 0) {
+                    throw new ParseException("Bad unicode escape", pos);
+                }
+                value = (value << 4) | digit;
+            }
+            pos += 4;
+            return (char) value;
         }
 
         private Object readNumber() {
@@ -245,15 +279,26 @@ public final class Json {
                 }
             }
             String num = s.substring(start, pos);
+            // RFC 8259 §6: no leading zeros, digits on both sides of '.', digits after the exponent.
+            if (!NUMBER.matcher(num).matches()) {
+                throw new ParseException("Bad number '" + num + "'", start);
+            }
             try {
                 if (integral) {
                     return Long.parseLong(num);
                 }
-                return Double.parseDouble(num);
+                double d = Double.parseDouble(num);
+                if (Double.isInfinite(d) || Double.isNaN(d)) {
+                    throw new ParseException("Number out of range '" + num + "'", start);
+                }
+                return d;
             } catch (NumberFormatException ex) {
                 throw new ParseException("Bad number '" + num + "'", start);
             }
         }
+
+        private static final java.util.regex.Pattern NUMBER =
+                java.util.regex.Pattern.compile("-?(0|[1-9][0-9]*)(\\.[0-9]+)?([eE][+-]?[0-9]+)?");
     }
 
     // ---------------------------------------------------------------- writing

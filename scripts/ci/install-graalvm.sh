@@ -4,19 +4,26 @@
 #
 # Installs the pinned GraalVM Community Edition (see docs/DECISIONS.md) and prints its JAVA_HOME.
 #
-#   JAVA_HOME="$(scripts/ci/install-graalvm.sh <install_dir>)"
+#   home="$(scripts/ci/install-graalvm.sh <install_dir>)"
 #
 # The tarball's SHA-256 is checked against the values pinned below, not against a checksum file downloaded
 # from the same place. Community Edition only (GPLv2 + Classpath Exception); never Oracle GraalVM.
+#
+# <install_dir>/download/ keeps the tarball (CI caches only that folder). Its checksum is verified on every run,
+# and the JDK is extracted afresh into <install_dir>/<release>/, so neither a stale nor a tampered cache can
+# become the compiler. Bumping the pin: release, asset_version and the three SHA-256 values below (the cache key
+# in .github/actions/setup hashes this file), and graalvm.sdk.version in java/pom.xml.
 set -euo pipefail
-release="graal-25.4.4.1.1"
-asset_version="25i4-25.0.4.1.1"
-# Pinned SHA-256 per platform (bash 3.2 compatible: macOS's /bin/bash has no associative arrays).
+release="graal-25.5.5.0.3"
+asset_version="25i5-25.0.5.0.3"
+graalvm_version="${release#graal-}"
+# Pinned SHA-256 per platform (bash 3.2 compatible: macOS's /bin/bash has no associative arrays). Taken from the
+# release's published .sha256 files and checked against GitHub's own asset digests.
 expected_sha256() {
   case "$1" in
-    linux-x64) echo 05ccbbe783210b6886ff7b08fcd0b061c5dce4852b05db87284fc0e24abb08e2 ;;
-    linux-aarch64) echo e5f5e2f59643cf96765c741dc00b206f86c69c8c1bf843fe26050c871e0e2dbc ;;
-    macos-aarch64) echo 4ec9932aa4aab1afca0ea31982d32d6f956615c61fe21a227b49756b25adda4f ;;
+    linux-x64) echo c6438dee6c3ade2220d40b7ccdcad24b512d30e233e61bb4fc70519522de34ef ;;
+    linux-aarch64) echo 41741c0650ae7564a78335f9e4fc353a902e6ff1d4140f2e4fabd1c55d5cce66 ;;
+    macos-aarch64) echo 54369d4a5931a5a2101c7c52444a4e7e6647a3a4e041335053cda6fd22295e0c ;;
   esac
 }
 dest="${1:?usage: install-graalvm.sh <install_dir>}"
@@ -26,20 +33,39 @@ platform="$os-$arch"
 expected="$(expected_sha256 "$platform")"
 [[ -n "$expected" ]] || { echo "GraalVM CE $release has no build for $platform" >&2; exit 1; }
 
+sha256_of() {
+  if command -v sha256sum >/dev/null; then sha256sum "$1" | cut -d' ' -f1; else shasum -a 256 "$1" | cut -d' ' -f1; fi
+}
 home_of() { if [[ "$os" == macos ]]; then echo "$1/Contents/Home"; else echo "$1"; fi; }
-mkdir -p "$dest"
-existing="$(find "$dest" -maxdepth 1 -type d -name 'graalvm-community-*' | head -1)"
-if [[ -n "$existing" && -x "$(home_of "$existing")/bin/native-image" ]]; then
-  home_of "$existing"
-  exit 0
-fi
 
 file="graalvm-community-jdk-${asset_version}_${platform}_bin.tar.gz"
-tmp="$(mktemp -d)"
-trap 'rm -rf "$tmp"' EXIT
-curl -fsSL --retry 3 -o "$tmp/$file" "https://github.com/graalvm/graalvm-ce-builds/releases/download/$release/$file"
-if command -v sha256sum >/dev/null; then actual="$(sha256sum "$tmp/$file" | cut -d' ' -f1)"; else actual="$(shasum -a 256 "$tmp/$file" | cut -d' ' -f1)"; fi
-[[ "$actual" == "$expected" ]] || { echo "SHA-256 mismatch for $file: $actual" >&2; exit 1; }
-tar -xzf "$tmp/$file" -C "$dest"
-installed="$(find "$dest" -maxdepth 1 -type d -name 'graalvm-community-*' | head -1)"
-home_of "$installed"
+downloads="$dest/download"
+tarball="$downloads/$file"
+mkdir -p "$downloads"
+# A cached tarball is used only if it still has the pinned checksum; anything else in download/ is dropped.
+if [[ -f "$tarball" && "$(sha256_of "$tarball")" != "$expected" ]]; then
+  echo "cached $file does not have the pinned SHA-256: downloading it again" >&2
+  rm -f "$tarball"
+fi
+find "$downloads" -mindepth 1 -maxdepth 1 ! -name "$file" -exec rm -rf {} +
+if [[ ! -f "$tarball" ]]; then
+  curl -fsSL --retry 3 -o "$tarball.part" "https://github.com/graalvm/graalvm-ce-builds/releases/download/$release/$file"
+  actual="$(sha256_of "$tarball.part")"
+  [[ "$actual" == "$expected" ]] || { rm -f "$tarball.part"; echo "SHA-256 mismatch for $file: $actual" >&2; exit 1; }
+  mv "$tarball.part" "$tarball"
+fi
+
+# Always a fresh extraction from the verified tarball.
+target="$dest/$release"
+rm -rf "$target" && mkdir -p "$target"
+tar -xzf "$tarball" -C "$target"
+installed="$(find "$target" -mindepth 1 -maxdepth 1 -type d -name 'graalvm-community-*' | head -1)"
+[[ -n "$installed" ]] || { echo "$file holds no graalvm-community-* folder" >&2; exit 1; }
+home="$(home_of "$installed")"
+# The release file must name the pinned Community Edition: guards against a wrong pin above.
+grep -qx 'IMPLEMENTOR="GraalVM Community"' "$home/release" \
+  || { echo "$home is not GraalVM Community Edition" >&2; exit 1; }
+grep -qx "GRAALVM_VERSION=\"$graalvm_version\"" "$home/release" \
+  || { echo "$home is not GraalVM $graalvm_version" >&2; exit 1; }
+[[ -x "$home/bin/native-image" ]] || { echo "$home has no bin/native-image" >&2; exit 1; }
+echo "$home"

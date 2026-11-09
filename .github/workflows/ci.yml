@@ -1,26 +1,29 @@
 # SPDX-FileCopyrightText: 2026 Coding Duck
 # SPDX-License-Identifier: LGPL-2.1-or-later
 #
-# dss-native CI. See docs/DECISIONS.md, "Phase 6".
+# dss-native release CI. See docs/DECISIONS.md, "Phase 6" and "Release gates".
 #
-# Runs only when a GitHub release is published, or when started by hand. Pushes and pull requests run nothing:
-# a full run takes about 25 minutes per platform, and private repositories pay for minutes beyond the plan's
-# allowance, macOS counting 10x.
+# Runs when a version tag is pushed, or when started by hand. Pushes and pull requests run the cheap checks in
+# checks.yml instead: a full run takes about 25 minutes per platform, and private repositories pay for minutes
+# beyond the plan's allowance, macOS counting 10x.
 #
-#   release published   linux-x64, linux-aarch64, macos-aarch64: JVM + native + C + Rust + differential tests,
-#                       package; online suites against the real EU LOTL and the seed trusted-list cache; then
-#                       the packages, the seed cache and the OJ keystore are uploaded to that release
-#   manual run          the same builds and tests, uploading nothing; online=true adds the online suites
+#   tag v1.2.3 pushed   linux-x64, linux-aarch64, macos-aarch64: JVM + native + C + Rust + differential tests,
+#                       package; the packages on the oldest supported systems (glibc 2.34, Ubuntu 22.04, macOS 14)
+#                       and on a zlib-ng distribution; the Docker image; online suites against the real EU LOTL and
+#                       the seed trusted-list cache. Only when every job passed is the GitHub release v1.2.3
+#                       created, with the packages, the seed cache, the OJ keystore, the corresponding sources,
+#                       SHA256SUMS and (public repository) build provenance, and published.
+#   manual run          the same builds and tests, publishing nothing; online=true adds the online suites
 #
-# The release tag is the version (v1.2.3 -> 1.2.3): the building jobs stamp it into java/pom.xml and
-# rust/Cargo.toml (scripts/ci/set-version.sh). Manual runs keep the committed 0.0.0-dev placeholder.
+# The tag is the version (v1.2.3 -> 1.2.3): the building jobs stamp it into java/pom.xml, rust/Cargo.toml and
+# rust/Cargo.lock (scripts/ci/set-version.sh). Manual runs keep the committed 0.0.0-dev placeholder.
 #
-# Actions are pinned to commit SHAs.
+# Actions are pinned to commit SHAs, container images to digests. No checkout keeps the job token in .git/config.
 name: CI
 
 on:
-  release:
-    types: [published]
+  push:
+    tags: ["v*"]
   workflow_dispatch:
     inputs:
       online:
@@ -41,14 +44,16 @@ jobs:
       version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        if: github.event_name == 'release'
+        if: github.ref_type == 'tag'
+        with:
+          persist-credentials: false
 
-      # Validated here, in seconds, rather than after the builds.
+      # Validated here, in seconds, rather than after the builds (semver.org, as Cargo requires).
       - id: version
-        name: Version from the release tag
-        if: github.event_name == 'release'
+        name: Version from the tag
+        if: github.ref_type == 'tag'
         env:
-          TAG: ${{ github.event.release.tag_name }}
+          TAG: ${{ github.ref_name }}
         run: |
           if [[ "$TAG" != v* ]]; then
             echo "::error::Release tag $TAG must be v<version>, like v1.2.0 or v1.2.0-rc.1"
@@ -71,18 +76,22 @@ jobs:
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - uses: ./.github/actions/setup
         with:
           platform: ${{ matrix.platform }}
+          release: ${{ github.ref_type == 'tag' }}
 
       # After setup, whose Maven cache key hashes the committed java/pom.xml.
-      - name: Version from the release tag
+      - name: Version from the tag
         if: needs.plan.outputs.version != ''
         env:
           VERSION: ${{ needs.plan.outputs.version }}
         run: scripts/ci/set-version.sh "$VERSION"
 
+      # build-native.sh refuses a JAVA_HOME that is not the pinned GraalVM CE release (CI=true).
       - name: JVM tests, native tests (exact reachability metadata), shared library
         run: scripts/build-native.sh --with-tests
 
@@ -92,11 +101,33 @@ jobs:
       - name: C smoke test
         run: scripts/smoke-test-c.sh
 
-      - name: Rust format and lints
+      # The library's entry points pin Locale.US and UTC themselves (DssLib's prologue); the JUnit suites apply
+      # the same defaults from a listener, so only the C and Rust callers can prove it on a foreign host.
+      - name: Italian locale and time zone
+        if: runner.os == 'Linux'
+        run: |
+          sudo locale-gen it_IT.UTF-8
+          locale -a | grep -qi '^it_IT.utf8$'
+
+      - name: C smoke test under it_IT.UTF-8 and Europe/Rome
+        env:
+          LANG: it_IT.UTF-8
+          LC_ALL: it_IT.UTF-8
+          TZ: Europe/Rome
+        run: scripts/smoke-test-c.sh
+
+      # Lints with the default features too (dss without tokio), and rustdoc with warnings fatal: broken
+      # intra-doc links and missing docs (dss has #![warn(missing_docs)]).
+      - name: Rust format, lints and docs
         working-directory: rust
+        env:
+          RUSTDOCFLAGS: -D warnings
         run: |
           cargo fmt --all --check
-          cargo clippy --workspace --all-features --all-targets -- -D warnings
+          cargo clippy --locked --workspace --all-features --all-targets -- -D warnings
+          cargo clippy --locked -p dss --all-targets -- -D warnings
+          cargo doc --locked -p dss --no-deps
+          cargo doc --locked -p dss --no-deps --all-features
 
       - name: Rust tests against the native library
         run: scripts/test-rust.sh
@@ -127,23 +158,97 @@ jobs:
             java/target/native-test-reports/
           if-no-files-found: ignore
 
+  # The packages as users run them: on the oldest systems README.md promises (glibc 2.34 = AlmaLinux 9,
+  # Ubuntu 22.04, macOS 14), on a distribution whose zlib is zlib-ng (Fedora), without Java or network, under an
+  # Italian locale. Besides loading and validating, every recorded external signature must complete: that needs
+  # the digest the JVM computed when recording, so a different deflate output (zlib-ng) or a different native
+  # drawing of a visible signature fails here instead of as SIGNING_FAILED in production.
+  compat:
+    name: ${{ matrix.platform }} on ${{ matrix.system }}
+    needs: [plan, build]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { platform: linux-x64, runner: ubuntu-24.04, system: almalinux-9, image: "almalinux:9@sha256:245f8aab832fe800aa42bdab5fad75ebbd8e0b4c9f24820a83c638b177857ae2" }
+          - { platform: linux-x64, runner: ubuntu-24.04, system: ubuntu-22.04, image: "ubuntu:22.04@sha256:076e7bf82319619f28dd0aa9c02ab34b055ad37100395b4f49a2ffba04fb5e11" }
+          - { platform: linux-x64, runner: ubuntu-24.04, system: fedora-44-zlib-ng, image: "fedora:44@sha256:15da97ed9aa94dd3d92c3925eb89520f6c80e07ea7ee24cba848d1f8b6912b3e" }
+          - { platform: linux-aarch64, runner: ubuntu-24.04-arm, system: almalinux-9, image: "almalinux:9@sha256:245f8aab832fe800aa42bdab5fad75ebbd8e0b4c9f24820a83c638b177857ae2" }
+          - { platform: linux-aarch64, runner: ubuntu-24.04-arm, system: ubuntu-22.04, image: "ubuntu:22.04@sha256:076e7bf82319619f28dd0aa9c02ab34b055ad37100395b4f49a2ffba04fb5e11" }
+          - { platform: linux-aarch64, runner: ubuntu-24.04-arm, system: fedora-44-zlib-ng, image: "fedora:44@sha256:15da97ed9aa94dd3d92c3925eb89520f6c80e07ea7ee24cba848d1f8b6912b3e" }
+          - { platform: macos-aarch64, runner: macos-14, system: macos-14, image: "" }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: dss-native-${{ matrix.platform }}
+          path: pkg
+
+      - name: Package on ${{ matrix.system }}
+        env:
+          IMAGE: ${{ matrix.image }}
+          VERSION: ${{ needs.plan.outputs.version || '0.0.0-dev' }}
+        run: |
+          tarball="$(ls pkg/dss-native-*.tar.gz)"
+          (cd pkg && sha256sum -c "$(basename "$tarball").sha256" 2>/dev/null || shasum -a 256 -c "$(basename "$tarball").sha256")
+          tar -xzf "$tarball" -C pkg
+          dir="$(basename "$tarball" .tar.gz)"
+          if [[ -n "$IMAGE" ]]; then
+            if [[ "$IMAGE" == fedora:* ]]; then
+              docker run --rm "$IMAGE" sh -c 'rpm -q zlib-ng-compat' # the point of this system
+            fi
+            docker run --rm --network none -e LANG=it_IT.UTF-8 -e TZ=Europe/Rome -v "$PWD:/src:ro" -w /src "$IMAGE" \
+              bash scripts/ci/package-smoke.sh "/src/pkg/$dir" /src/testdata/fixtures "$VERSION"
+          else
+            sw_vers
+            LANG=it_IT.UTF-8 TZ=Europe/Rome scripts/ci/package-smoke.sh "pkg/$dir" testdata/fixtures "$VERSION"
+          fi
+
+  # The dss-server image built from the linux-x64 package, as docs/server.md describes, checked offline.
+  docker:
+    needs: [plan, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: dss-native-linux-x64
+          path: docker-context
+
+      - name: Build the image, wait for its health check, run the package checks inside it
+        env:
+          VERSION: ${{ needs.plan.outputs.version || '0.0.0-dev' }}
+        run: scripts/ci/docker-smoke.sh docker-context "$VERSION"
+
   online:
     name: online (real EU LOTL) + seed cache
     if: >-
       (github.event_name == 'workflow_dispatch' && inputs.online) ||
-      github.event_name == 'release'
+      github.ref_type == 'tag'
     needs: plan
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - uses: ./.github/actions/setup
         with:
           platform: linux-x64
+          release: ${{ github.ref_type == 'tag' }}
 
       # After setup, whose Maven cache key hashes the committed java/pom.xml.
-      - name: Version from the release tag
+      - name: Version from the tag
         if: needs.plan.outputs.version != ''
         env:
           VERSION: ${{ needs.plan.outputs.version }}
@@ -162,15 +267,18 @@ jobs:
       - name: Rust tests, online (refresh while validating)
         run: scripts/test-rust.sh --online
 
+      # `tl refresh` succeeds once one certificate is loaded; check-tl-status.py then requires every list to be
+      # downloaded, validly signed, current and used for trust, as the JVM seeder does (alerts are warnings).
       - name: Seed trusted-list cache snapshot (full EU LOTL)
         run: |
-          (cd rust && cargo build -q --release -p dss-cli)
+          (cd rust && cargo build -q --locked --release -p dss-cli)
           cli=rust/target/release/dss-cli
           stamp="$(date -u +%Y%m%d)"
           rm -rf build/tl-seed && mkdir -p dist
           "$cli" --oj-keystore trust/oj-keystore.p12 --cache-dir build/tl-seed tl refresh
           "$cli" --oj-keystore trust/oj-keystore.p12 --cache-dir build/tl-seed tl status --json \
             > "dist/dss-native-tl-cache-$stamp.status.json"
+          python3 scripts/ci/check-tl-status.py "dist/dss-native-tl-cache-$stamp.status.json"
           tar -czf "dist/dss-native-tl-cache-$stamp.tar.gz" -C build/tl-seed tl
           (cd dist && sha256sum dss-native-tl-cache-*.tar.gz > "dss-native-tl-cache-$stamp.tar.gz.sha256")
 
@@ -180,15 +288,20 @@ jobs:
           path: dist/dss-native-tl-cache-*
           if-no-files-found: error
 
+  # Nothing is public before this job: the release is created as a draft, filled and only then published.
   release-assets:
-    name: upload to the GitHub release
-    if: github.event_name == 'release'
-    needs: [build, online]
+    name: create and publish the GitHub release
+    if: github.ref_type == 'tag'
+    needs: [plan, build, compat, docker, online]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       # Only the deliverables: not the reports-* artifacts.
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
@@ -202,11 +315,48 @@ jobs:
           name: tl-cache-snapshot
           path: release
 
-      # --clobber: a re-run replaces the assets it uploaded before.
-      - name: Upload to the release
+      # The corresponding source of everything in the packages, attached to the same release (LICENSING.md):
+      # this repository at the tag, DSS at its tag, GraalVM CE's components and its JDK at the build's commits.
+      - name: Sources, OJ keystore, SHA256SUMS
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          package="$(ls release/dss-native-"$VERSION"-linux-x64.tar.gz)"
+          tar -xzf "$package" -O "dss-native-$VERSION-linux-x64/licenses/graalvm/release" > "$RUNNER_TEMP/graalvm-release"
+          scripts/ci/fetch-sources.sh "$RUNNER_TEMP/graalvm-release" release
+          git archive --format=tar.gz --prefix="dss-native-$VERSION/" -o "release/dss-native-$VERSION-source.tar.gz" HEAD
+          cp trust/oj-keystore.p12 release/
+          (cd release && sha256sum -- * > "$RUNNER_TEMP/SHA256SUMS" && mv "$RUNNER_TEMP/SHA256SUMS" SHA256SUMS)
+          cat release/SHA256SUMS
+
+      # Signed SLSA provenance for every asset (Sigstore, verifiable with `gh attestation verify`). GitHub offers
+      # artifact attestations to private repositories only on Enterprise Cloud, so this runs once the repository
+      # is public.
+      - name: Build provenance
+        if: ${{ !github.event.repository.private }}
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-checksums: release/SHA256SUMS
+
+      - name: Create the release as a draft, upload, publish
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.event.release.tag_name }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+          VERSION: ${{ needs.plan.outputs.version }}
         run: |
-          cp trust/oj-keystore.p12 release/
-          gh release upload "$TAG" release/* --clobber
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            # Made by hand before CI finished, or the draft of an earlier attempt of this job: fill it (--clobber:
+            # a re-run replaces what it uploaded before), then publish it if it is still a draft.
+            echo "::warning::Release $TAG already existed; its assets are replaced"
+            gh release upload "$TAG" release/* --clobber
+            if [[ "$(gh release view "$TAG" --json isDraft --jq .isDraft)" == true ]]; then
+              gh release edit "$TAG" --draft=false
+            fi
+          else
+            prerelease=()
+            [[ "$VERSION" == *-* ]] && prerelease=(--prerelease)
+            gh release create "$TAG" --draft --verify-tag --title "$TAG" --generate-notes ${prerelease[@]+"${prerelease[@]}"}
+            gh release upload "$TAG" release/* --clobber
+            gh release edit "$TAG" --draft=false
+          fi

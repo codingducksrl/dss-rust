@@ -6,18 +6,23 @@
 ## Building
 
 ```bash
-export JAVA_HOME=<GraalVM CE 25.4.4.1.1>
+export JAVA_HOME=<GraalVM CE 25.5.5.0.3>
 scripts/build-native.sh               # or --with-tests: JVM tests + native tests first
 ```
+
+`build-native.sh` refuses a `JAVA_HOME` that is not GraalVM Community Edition. Another CE release than the pinned
+one (`graalvm.sdk.version` in `java/pom.xml`) only warns locally and is refused in CI (DECISIONS.md, "Dependency
+monitoring").
 
 Output, in `build/native/<os>-<arch>/` (`macos-aarch64`, `linux-x64`, `linux-aarch64`):
 
 | File | |
 |---|---|
-| `libdssnative.dylib` / `.so` | ~91 MB (macOS aarch64). macOS install name `@rpath/libdssnative.dylib`; Linux soname `libdssnative.so` |
+| `libdssnative.dylib` / `.so` | ~94 MB (macOS aarch64). macOS install name `@rpath/libdssnative.dylib`; Linux soname `libdssnative.so` |
 | `libdssnative.h` | the `dss_*` functions. Self-contained: it includes `<stddef.h>` and `<graal_isolate.h>` |
 | `graal_isolate.h` | isolate and thread management (`graal_create_isolate`, `graal_attach_thread`, …), exported by the same library |
 | `libdssnative_dynamic.h`, `graal_isolate_dynamic.h` | the same as function-pointer typedefs, for `dlopen` |
+| `licenses/` | licence texts and notices of everything compiled into the library, to ship with it (LICENSING.md) |
 
 Build choices:
 - **`-march=compatibility`**: runs on any x86-64 / ARMv8-A CPU. The default would target x86-64-v3 (AVX2) or
@@ -44,9 +49,18 @@ graal_isolatethread_t *thread;
 graal_create_isolate(NULL, &isolate, &thread);           /* once per process (or more, see below) */
 
 char *r = dss_init(thread, "/var/lib/app/dss-cache", config_json);
+/* {"ok":true,"trusted_lists_loaded":true,"log_level":"warn","initial_load":{...},
+    "oj_keystore":{"path":"...","sha256":"<64 hex>"}}: the root of trust in use, as dss_tl_status reports it */
 dss_free(thread, r);
 
 r = dss_validate(thread, bytes, len, NULL);              /* JSON: see README.md */
+/* ... */
+dss_free(thread, r);
+
+const char *names[] = { "contract.pdf" };                /* a detached .p7s with its content, no base64 */
+const char *contents[] = { content };
+size_t lens[] = { content_len };
+r = dss_validate_with_contents(thread, p7s, p7s_len, 1, names, contents, lens, NULL);
 /* ... */
 dss_free(thread, r);
 
@@ -77,15 +91,60 @@ The JSON contract (config, options, results, status, error codes) is in [README.
   that created the isolate must call `graal_attach_thread(isolate, &t)` first and `graal_detach_thread(t)`
   before it exits. All `dss_*` functions are thread-safe. `dss_validate`, `dss_extend` and the `dss_sign_*`
   functions run concurrently on any number of threads, also during `dss_tl_refresh_online`.
+  - **A wrong handle stops the process.** This is the precondition of every Native Image C API, checked before
+    any code of this library runs, so it cannot produce a JSON result. `NULL` fails with
+    `Fatal error: Failed to enter the specified IsolateThread context` (exit status 2). A handle that belongs to
+    *another* thread is a fatal error too (`A call from native code to Java code provided a ... IsolateThread
+    that is either corrupt or belongs to a different OS thread`, `SIGABRT`): the library is built with
+    `-H:+CheckIsolateThreadAtEntry`, because without it such a call is silently accepted and corrupts the
+    isolate. A handle of a torn-down isolate or of a detached thread points at freed memory: the call is
+    undefined behaviour, in practice a `SIGSEGV` or a fatal error, never a result to rely on. The C smoke test
+    runs the NULL and other-thread cases in forked children and fails if a child returns a result; the torn-down
+    case is run for information only. The Rust `dss` crate never exposes the handles, so only C hosts can get
+    this wrong; dss-server's PHP client talks HTTP and is not affected.
+- **Strings** (`cache_dir`, `config_json`, `options_json`, and each `names[i]` of `dss_validate_with_contents`)
+  are NUL-terminated UTF-8 and are decoded strictly: a malformed sequence is refused with `INVALID_ARGUMENT` (`"cache_dir is not valid UTF-8 (byte 11)"`, naming the
+  parameter and the offset of the first bad byte), never repaired with U+FFFD and acted upon, which would create
+  the cache or look for a snapshot at a path other than the one passed. Paths inside `config_json` are strings
+  of a JSON document, so they are checked the same way.
+- **Detached contents as buffers.** `dss_validate_with_contents` behaves as `dss_validate`, with `contents[i]`
+  (`lens[i]` bytes, named `names[i]`) added to `options_json`'s `detached_contents` before any entry the JSON
+  carries, exactly as if sent as `{"name": names[i], "base64": ...}`. `names` may be `NULL` (all unnamed), and so
+  may any `names[i]`; `count` 0 with `NULL` arrays is the same as `dss_validate`. It refuses with
+  `INVALID_ARGUMENT` and one of these messages: `count larger than 1024`; `contents and lens are required when
+  count is not 0`; `contents[<i>] is NULL`; `contents[<i>] is empty` (the JSON route refuses `"base64": ""` too);
+  `contents[<i>] larger than 2147483639 bytes`; `names[<i>] is not valid UTF-8 (byte <n>)`; `options_json is not
+  valid JSON: ...`; `options: 'detached_contents' must be an array of objects`. Everything else (unknown keys,
+  report names, `path` entries) is refused by the engine with its usual messages. The contents are not re-encoded
+  inside the library either: the entry point hands the engine views of the caller's buffers and each one is
+  copied into the Java heap once, inside the error handling, so a content too large for the heap is an
+  `INTERNAL_ERROR` result. The cap of 1024 exists because the entry point allocates one small object per content
+  before that error handling can run.
+- **Versions.** `dss_version` returns `{"ok":true,"library":"<semver>","dss":"6.5.1","runtime":"<JVM name and
+  version>","api_version":1}` and works before `dss_init`. `api_version` is the integer version of the C/JSON
+  contract this library speaks. It is bumped only on an incompatible change (a removed or renamed field, a changed
+  verdict or error-code meaning, a changed C signature); additive changes keep it. A caller built against a
+  different API version should refuse the library instead of guessing at the contract (the Rust `dss` crate does,
+  with `Error::Protocol`); a library that omits the field predates the check and is treated as version 1.
 - **Memory.** Every returned `char*` is malloc'd UTF-8 JSON owned by the caller: release it with `dss_free`.
-  `dss_free(NULL)` is allowed. Input strings and the document and signature buffers are only read during the
-  call. `dss_extend` and `dss_sign_complete` also hand back a document in `*out_document`: binary, `*out_len`
-  bytes, not NUL-terminated, owned by the caller and released with `dss_free` too. They set `*out_document` to
-  `NULL` and `*out_len` to 0 whenever the result is not `"ok":true`. Both out-parameters are required.
-- **Errors.** Results always carry `"ok"`. No Java exception ever reaches C. `NULL` is returned only if not
-  even an error result could be built (the Java heap and native memory are both exhausted).
+  `dss_free(NULL)` is allowed. Input strings and the document, detached-content and signature buffers are only
+  read during the call. `dss_extend` and `dss_sign_complete` also hand back a document in `*out_document`, and
+  `dss_tl_export_snapshot` a snapshot file in `*out_snapshot`: binary, `*out_len` bytes, not NUL-terminated,
+  owned by the caller and released with `dss_free` too. They set it to `NULL` and `*out_len` to 0 whenever the
+  result is not `"ok":true`. Both out-parameters are required. A call that fails allocates nothing the caller
+  must free: the document buffer is released again if its result JSON cannot be allocated.
+- **Errors.** Results always carry `"ok"`. No Java exception ever reaches C: what escapes the engine's own
+  handling (an `OutOfMemoryError` while decoding a string argument or copying a result, for instance) becomes
+  `{"ok":false,"error":{"code":"INTERNAL_ERROR","message":"java.lang.OutOfMemoryError: ..."}}`, written straight
+  into malloc'd memory without touching the Java heap, so it can be built when the heap is exhausted. `NULL` is
+  returned only if not even that `malloc` succeeds (native memory exhausted). The isolate stays usable in both
+  cases. A heap exhausted *during* DSS processing may instead abort the process: see "Heap size".
 - **Shutdown.** Call `dss_shutdown` before `graal_tear_down_isolate`, so the trusted-list worker threads stop.
-  Calling `dss_init` again replaces the engine without a shutdown.
+  Calling `dss_init` again replaces the engine without a shutdown. Call `dss_shutdown` only when no refresh is
+  running (wait for `dss_tl_refresh_online` to return, or check `refresh_in_progress` in `dss_tl_status`): a
+  trusted-list thread still inside an HTTP read ends only when the socket timeout does, and
+  `graal_tear_down_isolate` waits for it. The result's `trusted_list_threads_stopped` says whether the threads
+  stopped within the shutdown's wait (5 s); `false` means a tear-down may block until they do.
 - **Several isolates** in one process are independent (separate heaps, separate engines), and may validate at
   the same time: the C smoke test starts 4 at once. One isolate with many attached threads is the normal setup.
   Native code that assumes one JVM per process is the hazard here, which is why no JDK AWT library is shipped.
@@ -108,16 +167,43 @@ p.argc = 2; p.argv = args;
 graal_create_isolate(&p, &isolate, &thread);
 ```
 
-A document or report that does not fit the heap fails as
-`{"ok":false,"error":{"code":"INTERNAL_ERROR","message":"java.lang.OutOfMemoryError: …"}}` and the isolate stays
-usable. The smoke test checks this with a 128 MB document on a 64 MB heap.
+**What the heap cap does and does not do.** `-Xmx` bounds the isolate's memory; it is not a safety boundary
+that turns every oversized request into an error result. Two outcomes exist:
+
+- **A structured error, isolate kept.** An `OutOfMemoryError` raised on the *calling* thread is caught and
+  returned as `{"ok":false,"error":{"code":"INTERNAL_ERROR","message":"java.lang.OutOfMemoryError: …"}}`. This
+  is certain at the boundaries, where the library itself allocates: the copy of the document into the heap, the
+  decoding of a string argument, the encoding of the result. The smoke test checks a 128 MB document and a
+  128 MB `options_json` on a 64 MB heap, and that the isolate keeps working afterwards.
+- **The process aborts.** An `OutOfMemoryError` raised *while DSS is processing* the document can land on a
+  thread of the Native Image runtime instead of the caller's. The runtime treats that as fatal:
+  `Fatal error: Reference processing and cleaners must handle all potential exceptions:
+  java.lang.OutOfMemoryError: Garbage-collected heap size exceeded`, then `SIGABRT`, thread "Reference Handler".
+  Every isolate in the process dies with it. Which thread the error hits depends on the GC's timing, so the
+  same request can end either way: a 40 MB CAdES file validated with `dss-cli --max-heap` gave `INTERNAL_ERROR`
+  at 64m, 96m and 176m, an abort at 128m and 144m (3 runs of 3 each), and `TOTAL_PASSED` from 256m.
+
+No build or runtime option of GraalVM CE 25 changes this. `ReferenceHandlerThread.run` and
+`ReferenceHandler.processPendingReferencesInRegularThread` (the variant without the dedicated thread,
+`-R:-AutomaticReferenceHandling`) both end in `VMError.shouldNotReachHere` on any `Throwable`;
+`-H:+ExitOnOutOfMemoryError` and `-H:+ReportFatalErrorOnOutOfMemoryError` only make *every* heap OOM fatal.
+
+So size the heap for the work, and bound the work: validation needs several times the document in heap (the
+copy, DSS's and PDFBox's own copies, the reports), a signature or an extension more; with `-Xmx` set, limit the
+document size and the number of concurrent calls accordingly, and treat an abort as what it is, a crash of the
+host process. dss-server bounds the work entering the isolate with `--max-in-flight` and `--request-timeout`
+([server.md](server.md), "Sizing") for this reason. The smoke test runs the mid-processing case (preparing a
+PAdES signature of a 40 MB PDF on a 64 MB heap) in a forked child and accepts either outcome, never a success,
+a `NULL` or a hang.
 
 Implementation detail: Native Image unwinds an `OutOfMemoryError` raised by an allocation to the *calling*
 compiled frame, skipping handlers in the allocating frame itself. So the C entry points allocate nothing large:
 - the document goes to Java as a `ByteBuffer` view and is copied inside `DssJsonApi`'s error handling;
-- results are encoded to UTF-8 directly into malloc'd memory;
-- `dss_extend` and `dss_sign_complete` copy the document from the Java array `DssJsonApi` returned into malloc'd
-  memory.
+- results are encoded to UTF-8 directly into malloc'd memory, and so is the `INTERNAL_ERROR` result for an
+  error that escaped `DssJsonApi`, from strings that already exist, with no Java allocation at all;
+- `dss_extend`, `dss_sign_complete` and `dss_tl_export_snapshot` copy the document or snapshot from the Java
+  array `DssJsonApi` returned into malloc'd memory, before the result JSON, and release it again if the JSON's
+  `malloc` fails.
 
 ### Logging
 
@@ -183,7 +269,7 @@ Measured on macOS aarch64; see `docs/DECISIONS.md` for details.
 
 | | Covers |
 |---|---|
-| `./mvnw -Pnative test` | JUnit suite compiled as a native executable with `--exact-reachability-metadata` |
-| `scripts/smoke-test-c.sh` | C API from C: seeded synthetic TL cache (offline), all fixture kinds, `dss_extend` and `dss_sign_*` with their out-parameters, error paths, 4 attached threads, a small-heap isolate |
-| `scripts/smoke-test-c.sh --online` | Same against the real EU LOTL (IT): first refresh, refresh concurrent with validations, TLS CA embedding and override |
+| `cd java && ./mvnw -Pnative test` | JUnit suite compiled as a native executable with `--exact-reachability-metadata` |
+| `scripts/smoke-test-c.sh` | C API from C: the header compiles on its own; in forked children, the two deterministic handle misuses (NULL, another thread's) stop the process (the torn-down isolate is run for information) and a heap exhausted mid-processing ends as documented; 4 isolates started at once; seeded synthetic TL cache (offline), all fixture kinds, `dss_extend`, `dss_sign_*` (visible signatures too) and `dss_tl_export_snapshot` with their out-parameters, an engine started from the snapshot and a damaged one refused, error paths, malformed UTF-8 in `cache_dir`, `config_json` and `options_json`, 4 attached threads, `dss_init` three times and `dss_shutdown` while 4 threads validate (every result a success or `NOT_INITIALIZED`, `trusted_list_threads_stopped` true), a small-heap isolate (128 MB document and 128 MB `options_json` on 64 MB) |
+| `scripts/smoke-test-c.sh --online` | Same, except the 4 isolates, against the real EU LOTL (IT): first refresh, refresh concurrent with validations, TLS CA embedding and override |
 | `scripts/test-rust.sh [--online]` | The Rust `dss` crate against the library: fixtures, errors, threads, heap limit, refresh concurrency, scheduler. `dss-cli` with its stdout closed |

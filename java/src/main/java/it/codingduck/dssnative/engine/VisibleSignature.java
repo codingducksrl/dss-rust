@@ -7,6 +7,7 @@ package it.codingduck.dssnative.engine;
 
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
+import java.io.OutputStream;
 import java.time.DateTimeException;
 import java.time.Instant;
 import java.time.ZoneId;
@@ -27,6 +28,7 @@ import eu.europa.esig.dss.spi.DSSASN1Utils;
 import it.codingduck.dssnative.visible.Appearance;
 import it.codingduck.dssnative.visible.Appearance.ImagePosition;
 import it.codingduck.dssnative.visible.Appearance.TextAlign;
+import it.codingduck.dssnative.visible.FontCheck;
 import it.codingduck.dssnative.visible.SignatureImage;
 
 /**
@@ -39,6 +41,13 @@ public final class VisibleSignature {
     static final float DEFAULT_FONT_SIZE = 10;
     static final float MIN_FONT_SIZE = 4;
     static final float MAX_FONT_SIZE = 200;
+    /** The largest coordinate or box side: a PDF page is at most 200 inches (14400 points) a side. */
+    static final int MAX_POINTS = 14400;
+    /**
+     * The longest text, before and after its placeholders are filled in: a signature box holds a few lines, and
+     * laying out an unbounded text costs the engine time at every step of the shrink-to-fit loop.
+     */
+    static final int MAX_TEXT_LENGTH = 10_000;
     private static final String DEFAULT_DATE_FORMAT = "yyyy-MM-dd HH:mm:ss xxx";
     private static final Set<String> PLACEHOLDERS = Set.of("signer_name", "signing_time", "reason", "location");
     private static final Set<String> KEYS = Set.of("field", "page", "x", "y", "width", "height", "text", "font",
@@ -117,8 +126,8 @@ public final class VisibleSignature {
             y = coordinate(v, "y");
             width = (float) v.decimal("width", 0);
             height = (float) v.decimal("height", 0);
-            if (!(width > 0) || !(height > 0) || width > 14400 || height > 14400) {
-                throw v.error("'width' and 'height' must be more than 0 (points)");
+            if (!(width > 0) || !(height > 0) || width > MAX_POINTS || height > MAX_POINTS) {
+                throw v.error("'width' and 'height' must be more than 0 and at most " + MAX_POINTS + " (points)");
             }
         }
 
@@ -127,6 +136,9 @@ public final class VisibleSignature {
             String t = v.string("text", null).replace("\r\n", "\n").replace('\r', '\n').replace('\t', ' ');
             if (t.isBlank()) {
                 throw v.error("'text' is empty; leave it out for an image alone");
+            }
+            if (t.length() > MAX_TEXT_LENGTH) {
+                throw v.error(tooLong(t.length()));
             }
             text = parseTemplate(v, t);
         }
@@ -148,7 +160,7 @@ public final class VisibleSignature {
                 throw v.error("'font' needs 'text'");
             }
             font = base64(v, "font");
-            checkFont(v, font);
+            checkFont(v, font, literalText(text));
         }
         float fontSize = (float) v.decimal("font_size", DEFAULT_FONT_SIZE);
         if (!(fontSize >= MIN_FONT_SIZE) || fontSize > MAX_FONT_SIZE) {
@@ -205,6 +217,18 @@ public final class VisibleSignature {
                 });
             }
             rendered = sb.toString();
+            if (rendered.isBlank()) {
+                if (image == null) {
+                    throw new DssError(DssError.Code.INVALID_ARGUMENT, "options: pades.visible: 'text' is blank "
+                            + "once its placeholders are filled in (the value they stand for is empty) and there "
+                            + "is no image: give a text, or an image alone");
+                }
+                // nothing to write: the image fills the box on its own, as it would with no 'text'
+                rendered = null;
+            } else if (rendered.length() > MAX_TEXT_LENGTH) {
+                throw new DssError(DssError.Code.INVALID_ARGUMENT, "options: pades.visible: " + tooLong(
+                        rendered.length()) + " (once its placeholders are filled in)");
+            }
         }
         return new Appearance(field, page, x, y, width, height, rendered, font, fontSize, textColor, textAlign,
                 backgroundColor, image, imagePosition);
@@ -272,11 +296,26 @@ public final class VisibleSignature {
 
     private static float coordinate(JsonFields v, String key) {
         double d = v.decimal(key, 0);
-        if (!(d >= 0) || d > 14400) {
-            throw v.error("'" + key + "' must be 0 or more (points from the " + (key.equals("x") ? "left" : "top")
-                    + " edge of the page)");
+        if (!(d >= 0) || d > MAX_POINTS) {
+            throw v.error("'" + key + "' must be between 0 and " + MAX_POINTS + " (points from the "
+                    + (key.equals("x") ? "left" : "top") + " edge of the page)");
         }
         return (float) d;
+    }
+
+    private static String tooLong(int length) {
+        return "'text' is " + length + " characters long; at most " + MAX_TEXT_LENGTH + " are supported";
+    }
+
+    /** The template's literal parts, as a sample of what the font will have to show. */
+    private static String literalText(List<Part> text) {
+        StringBuilder sb = new StringBuilder();
+        for (Part part : text) {
+            if (part.literal != null) {
+                sb.append(part.literal);
+            }
+        }
+        return sb.toString();
     }
 
     /** Strict base64; only line breaks and other whitespace are skipped (the MIME decoder ignores anything). */
@@ -288,13 +327,33 @@ public final class VisibleSignature {
         }
     }
 
-    /** Loads the font the way the drawer will, so that an unusable font fails here rather than in DSS. */
-    private static void checkFont(JsonFields v, byte[] font) {
+    /**
+     * Loads the font the way the drawer will, so that an unusable font fails here rather than in DSS: its
+     * tables are checked first ({@link FontCheck}: a font can declare glyphs and character maps far larger
+     * than itself, and FontBox would allocate them), then it is loaded for subsetting, a sample of the text
+     * is encoded and the scratch document is saved, which runs the subsetter as the drawer's save will.
+     */
+    private static void checkFont(JsonFields v, byte[] font, String sample) {
         try (PDDocument scratch = new PDDocument()) {
-            PDType0Font.load(scratch, new ByteArrayInputStream(font), false);
+            FontCheck.check(font);
+            PDType0Font loaded = PDType0Font.load(scratch, new ByteArrayInputStream(font), true);
+            for (String probe : List.of(sample, "A", "a", "0", " ")) {
+                probe.codePoints().forEach(cp -> {
+                    try {
+                        loaded.encode(new String(Character.toChars(cp)));
+                        loaded.addToSubset(cp);
+                    } catch (IllegalArgumentException | IOException e) {
+                        // a character the font lacks: the drawer reports it against the final text
+                    }
+                });
+            }
+            scratch.save(OutputStream.nullOutputStream()); // subsets the font: reads its glyphs and metrics
         } catch (IOException | RuntimeException e) {
             throw v.error("'font' is not a usable TrueType font (TTF, or OTF with TrueType outlines): "
                     + e.getMessage());
+        } catch (OutOfMemoryError | StackOverflowError e) {
+            throw v.error("'font' is not a usable TrueType font: it is too large or too complex to load ("
+                    + e.getClass().getSimpleName() + ")");
         }
     }
 

@@ -13,6 +13,8 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.security.cert.CertificateEncodingException;
@@ -24,9 +26,14 @@ import java.util.List;
 import java.util.Set;
 import java.util.TimeZone;
 import java.util.function.Function;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
+import org.bouncycastle.asn1.ASN1Encoding;
+import org.bouncycastle.asn1.ASN1InputStream;
 import org.bouncycastle.asn1.cms.ContentInfo;
 import org.bouncycastle.asn1.cms.SignedData;
+import org.bouncycastle.util.encoders.Hex;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
@@ -39,6 +46,7 @@ import eu.europa.esig.dss.spi.DSSUtils;
 
 import it.codingduck.dssnative.testsupport.ExternalSigner;
 import it.codingduck.dssnative.testsupport.ExternalSigner.Cms;
+import it.codingduck.dssnative.testsupport.ExternalSigner.Tamper;
 import it.codingduck.dssnative.testsupport.Fixtures;
 import it.codingduck.dssnative.testsupport.TestEngines;
 import it.codingduck.dssnative.testsupport.TestPki;
@@ -65,6 +73,9 @@ class SigningTest {
     private DssEngine noTrust;
     private ExternalSigner rsa;
     private ExternalSigner ec;
+    /** Signers holding keys whose certificates are not for signing documents: the root CA's and the TSA's. */
+    private ExternalSigner ca;
+    private ExternalSigner tsa;
     private byte[] pdf;
     private byte[] text;
 
@@ -77,6 +88,8 @@ class SigningTest {
         noTrust = t.engine(tmp.resolve("cache-empty"), TestEngines.tsa());
         rsa = new ExternalSigner(t.pki, Entity.SIGNER_RSA);
         ec = new ExternalSigner(t.pki, Entity.SIGNER_EC);
+        ca = new ExternalSigner(t.pki, Entity.ROOT_CA);
+        tsa = new ExternalSigner(t.pki, Entity.TSA);
         pdf = Fixtures.read("content/document.pdf");
         text = Fixtures.read("content/document.txt");
     }
@@ -227,8 +240,9 @@ class SigningTest {
         assertEquals(Instant.parse("2026-06-01T10:00:00Z"), a.signingTime());
         for (String other : List.of("\"signing_time\":\"2026-06-01T10:00:01Z\"", "\"filename\":\"other.pdf\"",
                 "\"pades\":{\"content_size\":20000}", "\"pades\":{\"reason\":\"x\"}")) {
-            SigningOptions changed = options("{\"mode\":\"cms\",\"level\":\"B\",\"signing_time\":"
-                    + "\"2026-06-01T10:00:00Z\"," + other + "}");
+            // The JSON parser refuses duplicate keys, so another signing time replaces the first one.
+            String time = other.startsWith("\"signing_time\"") ? "" : "\"signing_time\":\"2026-06-01T10:00:00Z\",";
+            SigningOptions changed = options("{\"mode\":\"cms\",\"level\":\"B\"," + time + other + "}");
             assertFalse(Arrays.equals(a.digest(), engine.prepareSignature(pdf, changed).digest()), other);
         }
         Instant now = engine.prepareSignature(pdf, options("{\"mode\":\"cms\",\"level\":\"B\"}")).signingTime();
@@ -513,5 +527,239 @@ class SigningTest {
                 options("{\"mode\":\"cms\",\"level\":\"B\",\"packaging\":\"enveloping\"}")));
         fails(DssError.Code.INVALID_ARGUMENT, () -> engine.prepareSignature(text,
                 options("{\"mode\":\"cms\",\"level\":\"B\",\"pades\":{\"reason\":\"x\"}}")));
+    }
+
+    // ------------------------------------------------------------------ what the external CMS must look like
+
+    /** Every refusal of {@code complete} in mode "cms", each reported as SIGNING_FAILED with its reason. */
+    @Test
+    void everyFlawInAnExternalCmsIsRefusedWithItsReason() {
+        SigningOptions o = options("{\"mode\":\"cms\",\"level\":\"B\"}");
+        record Case(Tamper tamper, String reason) { }
+        for (Case c : List.of(
+                new Case(Tamper.UNPARSEABLE, "cannot be parsed"),
+                new Case(Tamper.TWO_SIGNERS, "2 signers"),
+                new Case(Tamper.NO_SIGNED_ATTRIBUTES, "no signed attributes"),
+                new Case(Tamper.NO_CONTENT_TYPE, "content-type attribute with value id-data"),
+                new Case(Tamper.EMPTY_CONTENT_TYPE, "content-type attribute has 0 values"),
+                new Case(Tamper.NO_MESSAGE_DIGEST, "no message-digest attribute"),
+                new Case(Tamper.EMPTY_MESSAGE_DIGEST, "message-digest attribute has 0 values"),
+                new Case(Tamper.NO_SIGNING_CERTIFICATE, "no signing-certificate-v2 (or signing-certificate)"),
+                new Case(Tamper.WRONG_SIGNING_CERTIFICATE_HASH, "certificate hash differs"),
+                new Case(Tamper.NO_CERTIFICATE, "does not contain its signer's certificate"),
+                new Case(Tamper.BROKEN_SIGNATURE, "does not verify with its signer's certificate"),
+                new Case(Tamper.SHA1_SIGNATURE, "RSA with SHA1, the options say SHA256"),
+                new Case(Tamper.BOGUS_TIMESTAMP, "does not hold a timestamp token"),
+                new Case(Tamper.FOREIGN_TIMESTAMP, "message imprint does not match"),
+                new Case(Tamper.EXTRA_UNSIGNED_ATTRIBUTE, "unsigned attribute certificate-values"),
+                new Case(Tamper.WRONG_SERIAL, "names serial number"),
+                new Case(Tamper.WRONG_ISSUER, "names another issuer"),
+                new Case(Tamper.NO_CERTIFICATE_REFERENCED, "references no certificate"),
+                new Case(Tamper.UNKNOWN_CERTIFICATE_HASH_ALGORITHM, "unsupported algorithm (1.2.3.4)"),
+                new Case(Tamper.MALFORMED_SIGNING_CERTIFICATE, "the external CMS is malformed"),
+                new Case(Tamper.DUPLICATE_ATTRIBUTE, "2 content-type attributes"),
+                new Case(Tamper.WRONG_KEY, "but the signer's certificate holds a"),
+                new Case(Tamper.UNKNOWN_SIGNATURE_ALGORITHM, "unsupported signature algorithm (1.2.3.4.5)"),
+                new Case(Tamper.BROKEN_TIMESTAMP_SIGNATURE, "does not verify with any certificate in the token or the CMS"),
+                new Case(Tamper.TIMESTAMP_WITHOUT_TSA_CERTIFICATE,
+                        "does not verify with any certificate in the token or the CMS"),
+                new Case(Tamper.TWO_TIMESTAMPS, "two signature-time-stamp attributes"))) {
+            DssError e = fails(DssError.Code.SIGNING_FAILED, () -> sign(engine, pdf, o,
+                    p -> rsa.cms(p.digestAlgorithm(), p.digest(), EnumSet.noneOf(Cms.class), c.tamper())));
+            assertMessage(e, c.reason());
+            // The same shapes from an ECDSA signer, over content (CAdES).
+            DssError cades = fails(DssError.Code.SIGNING_FAILED, () -> sign(engine, text, o,
+                    p -> ec.cms(p.digestAlgorithm(), p.digest(), EnumSet.of(Cms.SIGNING_TIME), c.tamper())));
+            assertMessage(cades, c.tamper() == Tamper.SHA1_SIGNATURE ? "ECDSA with SHA1" : c.reason());
+        }
+    }
+
+    @Test
+    void aV1SigningCertificateAttributeIsAccepted() {
+        SigningResult r = sign(engine, pdf, options("{\"mode\":\"cms\",\"level\":\"B\"}"),
+                p -> rsa.cms(p.digestAlgorithm(), p.digest(), EnumSet.noneOf(Cms.class), Tamper.SIGNING_CERTIFICATE_V1));
+        assertValidatesAs(engine, r.document(), null, "PAdES-BASELINE-B");
+    }
+
+    /** A signature timestamp the CMS brings is trusted only once it has been verified; a bad one is not T. */
+    @Test
+    void aBrokenSignatureTimestampInTheCmsIsRefusedBeforeAnyTimestampIsSpent() {
+        for (String level : List.of("B", "T", "LT")) {
+            SigningOptions o = options("{\"mode\":\"cms\",\"level\":\"" + level + "\"}");
+            int hits = tsaHits();
+            for (Tamper tamper : List.of(Tamper.BOGUS_TIMESTAMP, Tamper.FOREIGN_TIMESTAMP)) {
+                fails(DssError.Code.SIGNING_FAILED, () -> sign(engine, pdf, o,
+                        p -> rsa.cms(p.digestAlgorithm(), p.digest(), EnumSet.noneOf(Cms.class), tamper)));
+                fails(DssError.Code.SIGNING_FAILED, () -> sign(engine, text, o,
+                        p -> rsa.cms(p.digestAlgorithm(), p.digest(), EnumSet.of(Cms.SIGNING_TIME), tamper)));
+            }
+            assertEquals(hits, tsaHits(), "nothing was timestamped at level " + level);
+        }
+    }
+
+    // ------------------------------------------------------------------ the signing certificate
+
+    @Test
+    void cmsModeChecksTheCertificateValidityAtTheSigningTime() {
+        // Given up front, the certificate is checked at prepare, in both formats.
+        for (byte[] document : List.of(pdf, text)) {
+            SigningOptions given = options("{\"mode\":\"cms\",\"level\":\"B\",\"signing_time\":"
+                    + "\"2020-01-01T00:00:00Z\",\"signing_certificate\":\"" + certificate(Entity.SIGNER_RSA) + "\"}");
+            assertMessage(fails(DssError.Code.SIGNING_FAILED, () -> engine.prepareSignature(document, given)),
+                    "not yet valid at the signing time 2020-01-01T00:00:00Z");
+        }
+        // Known only from the CMS, it is checked at complete: for PAdES at the options' signing time ...
+        SigningOptions pades = options("{\"mode\":\"cms\",\"level\":\"B\",\"signing_time\":\"2020-01-01T00:00:00Z\"}");
+        PreparedSignature prepared = engine.prepareSignature(pdf, pades);
+        byte[] cms = rsa.cms(prepared.digestAlgorithm(), prepared.digest(), EnumSet.noneOf(Cms.class));
+        assertMessage(fails(DssError.Code.SIGNING_FAILED, () -> engine.completeSignature(pdf, pades, cms)),
+                "not yet valid at the signing time 2020-01-01T00:00:00Z");
+        // ... for CAdES at the time the CMS's own signing-time attribute claims.
+        SigningOptions cades = options("{\"mode\":\"cms\",\"level\":\"B\"}");
+        assertMessage(fails(DssError.Code.SIGNING_FAILED, () -> sign(engine, text, cades,
+                p -> rsa.cms(p.digestAlgorithm(), p.digest(), EnumSet.of(Cms.SIGNING_TIME), Tamper.OLD_SIGNING_TIME))),
+                "not yet valid at the signing time 2020-01-01T00:00:00Z");
+    }
+
+    @Test
+    void certificatesNotMeantForSigningDocumentsAreRefused() {
+        // Mode "signature_value": at prepare, before the signer is asked anything.
+        SigningOptions caValue = options("{\"mode\":\"signature_value\",\"level\":\"B\"," + certificates(Entity.ROOT_CA)
+                + "}");
+        assertMessage(fails(DssError.Code.SIGNING_FAILED, () -> engine.prepareSignature(pdf, caValue)),
+                "is a CA certificate");
+        SigningOptions tsaValue = options("{\"mode\":\"signature_value\",\"level\":\"B\"," + certificates(Entity.TSA)
+                + "}");
+        assertMessage(fails(DssError.Code.SIGNING_FAILED, () -> engine.prepareSignature(text, tsaValue)),
+                "extended key usage (timeStamping)");
+        // Mode "cms": at prepare when the certificate is given, otherwise on the certificate in the CMS.
+        SigningOptions caGiven = options("{\"mode\":\"cms\",\"level\":\"B\",\"signing_certificate\":\""
+                + certificate(Entity.ROOT_CA) + "\"}");
+        assertMessage(fails(DssError.Code.SIGNING_FAILED, () -> engine.prepareSignature(pdf, caGiven)),
+                "is a CA certificate");
+        SigningOptions cms = options("{\"mode\":\"cms\",\"level\":\"LT\"}");
+        int hits = tsaHits();
+        assertMessage(fails(DssError.Code.SIGNING_FAILED, () -> sign(engine, pdf, cms,
+                cmsFrom(ca, EnumSet.noneOf(Cms.class)))), "is a CA certificate");
+        assertMessage(fails(DssError.Code.SIGNING_FAILED, () -> sign(engine, text, cms,
+                cmsFrom(tsa, EnumSet.of(Cms.SIGNING_TIME)))), "extended key usage (timeStamping)");
+        assertEquals(hits, tsaHits(), "refused before any timestamp was requested");
+    }
+
+    // ------------------------------------------------------------------ what prepare refuses up front
+
+    /**
+     * From T up (in mode "cms"; LT up in both modes) DSS re-checks the PDF's existing signatures when it extends
+     * the document, after the new signature is in. prepare runs those checks first, so the external signature is
+     * not spent on a PDF complete would refuse.
+     */
+    @Test
+    void aPdfWhoseExistingSignaturesCompleteWouldRefuseIsRefusedAtPrepare() {
+        byte[] tampered = Fixtures.read("tampered/pades/b-b.pdf");
+        for (String level : List.of("T", "LT", "LTA")) {
+            SigningOptions cms = options("{\"mode\":\"cms\",\"level\":\"" + level + "\"}");
+            assertMessage(fails(DssError.Code.SIGNING_FAILED, () -> engine.prepareSignature(tampered, cms)),
+                    "existing signatures cannot be extended to " + level);
+        }
+        for (String level : List.of("LT", "LTA")) {
+            SigningOptions value = options("{\"mode\":\"signature_value\",\"level\":\"" + level + "\","
+                    + certificates(Entity.SIGNER_RSA) + "}");
+            assertMessage(fails(DssError.Code.SIGNING_FAILED, () -> engine.prepareSignature(tampered, value)),
+                    "existing signatures cannot be extended to " + level);
+        }
+        // At B nothing is extended; at T in mode "signature_value" the timestamp goes into the new CMS only.
+        SigningResult b = sign(engine, tampered, options("{\"mode\":\"cms\",\"level\":\"B\"}"),
+                cmsFrom(rsa, EnumSet.noneOf(Cms.class)));
+        assertEquals("PAdES-BASELINE-B", b.level().toString());
+        SigningResult t = sign(engine, tampered, options("{\"mode\":\"signature_value\",\"level\":\"T\","
+                + certificates(Entity.SIGNER_RSA) + "}"), valueFrom(rsa));
+        assertEquals("PAdES-BASELINE-T", t.level().toString());
+
+        // A PDF whose signature is sound is co-signed, and every signature ends up at LT.
+        byte[] signedOnce = Fixtures.read("pades/b-b.pdf");
+        SigningResult lt = sign(engine, signedOnce, options("{\"mode\":\"cms\",\"level\":\"LT\"}"),
+                cmsFrom(rsa, EnumSet.noneOf(Cms.class)));
+        ValidationResult v = validate(engine, lt.document(), null);
+        assertEquals(List.of(PASSED, PASSED), FixtureValidationTest.verdicts(v), () -> v.reports.get(ReportKind.SIMPLE));
+        v.signatures.forEach(s -> assertEquals("PAdES-BASELINE-LT", s.format().toString()));
+
+        // Existing signatures already at T, mode "signature_value" (the new CMS brings its own timestamp): DSS adds
+        // no document timestamp first and only re-checks that the signatures verify, as prepare does.
+        byte[] tamperedT = Fixtures.read("tampered/pades/b-t.pdf");
+        SigningOptions valueLt = options("{\"mode\":\"signature_value\",\"level\":\"LT\","
+                + certificates(Entity.SIGNER_RSA) + "}");
+        assertMessage(fails(DssError.Code.SIGNING_FAILED, () -> engine.prepareSignature(tamperedT, valueLt)),
+                "existing signatures cannot be extended to LT");
+        SigningResult coSigned = sign(engine, Fixtures.read("pades/b-t.pdf"), valueLt, valueFrom(rsa));
+        ValidationResult vt = validate(engine, coSigned.document(), null);
+        assertEquals(List.of(PASSED, PASSED), FixtureValidationTest.verdicts(vt),
+                () -> vt.reports.get(ReportKind.SIMPLE));
+        vt.signatures.forEach(s -> assertEquals("PAdES-BASELINE-LT", s.format().toString()));
+    }
+
+    @Test
+    void aContentSizeTheCmsCannotFitIsRefusedAtPrepare() {
+        SigningOptions small = options("{\"mode\":\"signature_value\",\"level\":\"B\",\"pades\":{\"content_size\":500},"
+                + certificates(Entity.SIGNER_RSA) + "}");
+        assertMessage(fails(DssError.Code.INVALID_ARGUMENT, () -> engine.prepareSignature(pdf, small)),
+                "'pades.content_size' is 500 bytes, but the CMS");
+        // The estimate is a lower bound: what passes it is signed.
+        SigningOptions enough = options("{\"mode\":\"signature_value\",\"level\":\"B\",\"pades\":{\"content_size\":4000},"
+                + certificates(Entity.SIGNER_RSA) + "}");
+        assertValidatesAs(engine, sign(engine, pdf, enough, valueFrom(rsa)).document(), null, "PAdES-BASELINE-B");
+    }
+
+    /**
+     * The estimate counts the certificates DSS embeds, selected as DSS selects them: the chain from the signing
+     * certificate up to the trust anchor (which is left out), and nothing off that path. So a content_size the
+     * real CMS fits is never refused, whatever else the chain carries.
+     */
+    @Test
+    void theContentSizeEstimateCountsOnlyTheCertificatesDssEmbeds() {
+        // The chain carries the root (the trust anchor) and a certificate that is not on the signer's path at all.
+        String chain = "\"signing_certificate\":\"" + certificate(Entity.SIGNER_RSA) + "\",\"certificate_chain\":[\""
+                + certificate(Entity.ROOT_CA) + "\",\"" + certificate(Entity.TL_SIGNER) + "\"]";
+        Function<Integer, SigningOptions> with = size -> options("{\"mode\":\"signature_value\",\"level\":\"B\","
+                + "\"pades\":{\"content_size\":" + size + "}," + chain + "}");
+        int real = cmsLength(sign(engine, pdf, with.apply(20000), valueFrom(rsa)).document());
+        // Exactly the real size fits, although the chain holds two certificates DSS leaves out of the CMS.
+        SigningResult tight = sign(engine, pdf, with.apply(real), valueFrom(rsa));
+        assertValidatesAs(engine, tight.document(), null, "PAdES-BASELINE-B");
+        // The estimate is tighter than the length of the off-path certificate: that much less is refused.
+        int offPath = t.pki.token(Entity.TL_SIGNER).getEncoded().length;
+        assertMessage(fails(DssError.Code.INVALID_ARGUMENT, () -> engine.prepareSignature(pdf, with.apply(real - offPath))),
+                "but the CMS DSS builds around the signature value will be at least");
+    }
+
+    /** The DER length of the CMS in the last signature of {@code signedPdf} (its /Contents, zero-padded by DSS). */
+    private static int cmsLength(byte[] signedPdf) {
+        Matcher m = Pattern.compile("/Contents\\s*<([0-9A-Fa-f]+)>")
+                .matcher(new String(signedPdf, StandardCharsets.ISO_8859_1));
+        String hex = null;
+        while (m.find()) {
+            hex = m.group(1);
+        }
+        assertNotNull(hex, "a /Contents entry");
+        try (ASN1InputStream in = new ASN1InputStream(Hex.decode(hex))) {
+            return in.readObject().getEncoded(ASN1Encoding.DER).length;
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
+    }
+
+    /** PAdES level T: mode "cms" adds a document timestamp, mode "signature_value" a signature timestamp. */
+    @Test
+    void padesLevelTTimestampKindDependsOnTheMode() {
+        SigningResult cms = sign(engine, pdf, options("{\"mode\":\"cms\",\"level\":\"T\"}"),
+                cmsFrom(rsa, EnumSet.noneOf(Cms.class)));
+        assertTrue(appended(cms).contains("/DocTimeStamp"), "cms: a document timestamp revision");
+        SigningResult value = sign(engine, pdf, options("{\"mode\":\"signature_value\",\"level\":\"T\","
+                + certificates(Entity.SIGNER_RSA) + "}"), valueFrom(rsa));
+        assertFalse(appended(value).contains("/DocTimeStamp"), "signature_value: the timestamp is inside the CMS");
+        assertValidatesAs(engine, value.document(), null, "PAdES-BASELINE-T");
+    }
+
+    private String appended(SigningResult r) {
+        return new String(r.document(), pdf.length, r.document().length - pdf.length, StandardCharsets.ISO_8859_1);
     }
 }

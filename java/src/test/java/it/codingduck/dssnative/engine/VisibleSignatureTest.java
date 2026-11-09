@@ -9,10 +9,14 @@ import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.security.cert.CertificateEncodingException;
@@ -26,8 +30,16 @@ import java.util.Map;
 import java.util.TimeZone;
 
 import org.apache.pdfbox.Loader;
+import org.apache.pdfbox.cos.COSArray;
+import org.apache.pdfbox.cos.COSDictionary;
+import org.apache.pdfbox.cos.COSName;
+import org.apache.pdfbox.cos.COSStream;
 import org.apache.pdfbox.pdmodel.PDDocument;
+import org.apache.pdfbox.pdmodel.PDPage;
+import org.apache.pdfbox.pdmodel.PDResources;
 import org.apache.pdfbox.pdmodel.common.PDRectangle;
+import org.apache.pdfbox.pdmodel.common.PDStream;
+import org.apache.pdfbox.pdmodel.graphics.color.PDOutputIntent;
 import org.apache.pdfbox.pdmodel.interactive.annotation.PDAnnotationWidget;
 import org.apache.pdfbox.pdmodel.interactive.form.PDField;
 import org.apache.pdfbox.pdmodel.interactive.form.PDSignatureField;
@@ -45,6 +57,7 @@ import it.codingduck.dssnative.testsupport.TestEngines;
 import it.codingduck.dssnative.testsupport.TestImages;
 import it.codingduck.dssnative.testsupport.TestPki.Entity;
 import it.codingduck.dssnative.visible.Appearance;
+import it.codingduck.dssnative.visible.CraftedFonts;
 
 /**
  * Visible signatures ({@code pades.visible}). Every appearance is signed through prepare and complete, and the
@@ -238,6 +251,26 @@ class VisibleSignatureTest {
 
     // ------------------------------------------------------------------ determinism
 
+    /**
+     * The committed signing fixtures hold an external signature over the digest the JVM prepared when they were
+     * recorded; completing them proves the appearance is still drawn byte for byte the same (the Rust, CLI and
+     * C tests do the same through the native library). A layout change that alters the bytes fails here first.
+     */
+    @Test
+    void theRecordedVisibleFixturesStillComplete() {
+        for (String[] c : new String[][] {{"pades-visible-cms", "content/document.pdf"},
+                {"pades-visible-field-signature-value", "content/form.pdf"}}) {
+            byte[] document = Fixtures.read(c[1]);
+            SigningOptions o = SigningOptions.fromJson(new String(Fixtures.read("signing/" + c[0] + ".json"),
+                    StandardCharsets.UTF_8));
+            SigningResult r = engine.completeSignature(document, o, Fixtures.read("signing/" + c[0] + ".sig"));
+            ValidationResult v = engine.validate(r.document(), new ValidationOptions(null, List.of(), null, null,
+                    false));
+            assertEquals(List.of(PASSED), FixtureValidationTest.verdicts(v), c[0]);
+            keep("fixture-" + c[0], r.document());
+        }
+    }
+
     @Test
     void preparingIsRepeatableAndFollowsTheAppearance() {
         String base = BOX + ",\"text\":\"{signer_name}\\n{signing_time}\",\"image\":\"" + png + "\"";
@@ -281,6 +314,62 @@ class VisibleSignatureTest {
                 null).text());
     }
 
+    /**
+     * An empty template is refused when parsed; a template that becomes blank once filled in is refused too
+     * when there is nothing else to draw, and leaves the image alone in the box when there is one.
+     */
+    @Test
+    void textThatIsBlankOnceFilledInIsRefusedUnlessAnImageRemains() {
+        for (String reason : List.of("", "   ")) {
+            DssError e = fails(DssError.Code.INVALID_ARGUMENT, () -> appearance("{" + BOX + ",\"text\":\"{reason}\"}",
+                    null, reason));
+            assertMessage(e, "'text' is blank once its placeholders are filled in");
+            assertMessage(e, "there is no image");
+            Appearance imageAlone = appearance("{" + BOX + ",\"text\":\" {reason} \",\"image\":\"" + png + "\"}",
+                    null, reason);
+            assertNull(imageAlone.text(), "nothing to write: the image fills the box as with no 'text'");
+            assertNotNull(imageAlone.image());
+        }
+        assertEquals("ok", appearance("{" + BOX + ",\"text\":\"{reason}\"}", null, "ok").text());
+        sign(pdf, options("\"reason\":\"\",\"visible\":{" + BOX + ",\"text\":\"{reason}\",\"image\":\"" + png
+                + "\"}"), "image-with-blank-text");
+    }
+
+    /**
+     * A caller font with no glyph for the space (a symbol or icon font) shows a one-word text: the space is
+     * measured only when the text has one; a text the font cannot show is INVALID_ARGUMENT, not SIGNING_FAILED.
+     */
+    @Test
+    void aFontWithoutASpaceGlyphShowsASingleWord() {
+        String font = b64(CraftedFonts.noSpaceGlyph());
+        sign(pdf, options("\"visible\":{" + BOX + ",\"text\":\"Approvato\",\"font\":\"" + font + "\"}"),
+                "font-without-space");
+        DssError e = fails(DssError.Code.INVALID_ARGUMENT, () -> engine.prepareSignature(pdf, options("\"visible\":{"
+                + BOX + ",\"text\":\"Approvato oggi\",\"font\":\"" + font + "\"}")));
+        assertMessage(e, "the font cannot show the text");
+    }
+
+    /** A font whose left-side-bearing array is short is embedded as FontBox reads it (missing bearings are 0). */
+    @Test
+    void aFontWithAShortBearingArrayIsEmbedded() {
+        sign(pdf, options("\"visible\":{" + BOX + ",\"text\":\"Approvato\",\"font\":\""
+                + b64(CraftedFonts.shortLeftSideBearings()) + "\"}"), "font-short-bearings");
+    }
+
+    /** The text is bounded before and after its placeholders are filled in. */
+    @Test
+    void textLengthIsBounded() {
+        String longest = "x".repeat(VisibleSignature.MAX_TEXT_LENGTH);
+        assertEquals(longest, appearance("{" + BOX + ",\"text\":\"" + longest + "\"}", null, null).text());
+        DssError e = fails(DssError.Code.INVALID_ARGUMENT, () -> options("\"visible\":{" + BOX + ",\"text\":\""
+                + longest + "x\"}"));
+        assertMessage(e, "'text' is " + (VisibleSignature.MAX_TEXT_LENGTH + 1) + " characters long; at most "
+                + VisibleSignature.MAX_TEXT_LENGTH);
+        e = fails(DssError.Code.INVALID_ARGUMENT, () -> appearance("{" + BOX + ",\"text\":\"{reason}\"}", null,
+                longest + "x"));
+        assertMessage(e, "once its placeholders are filled in");
+    }
+
     @Test
     void theSignerNameFallsBackToTheCertificate() {
         SigningOptions o = SigningOptions.fromJson("{\"mode\":\"cms\",\"level\":\"B\"," + TIME
@@ -307,6 +396,12 @@ class VisibleSignatureTest {
         cases.put("{\"field\":\"Firma1\"," + BOX + ",\"text\":\"x\"}", "either 'field'");
         cases.put("{\"text\":\"x\"}", "'page' is required");
         cases.put("{\"page\":1,\"x\":0,\"y\":0,\"width\":0,\"height\":10,\"text\":\"x\"}", "'width' and 'height'");
+        cases.put("{\"page\":1,\"x\":0,\"y\":0,\"width\":20000,\"height\":10,\"text\":\"x\"}",
+                "'width' and 'height' must be more than 0 and at most 14400");
+        cases.put("{\"page\":1,\"x\":20000,\"y\":0,\"width\":10,\"height\":10,\"text\":\"x\"}",
+                "'x' must be between 0 and 14400");
+        cases.put("{\"page\":1,\"x\":0,\"y\":-1,\"width\":10,\"height\":10,\"text\":\"x\"}",
+                "'y' must be between 0 and 14400");
         cases.put("{\"page\":0,\"x\":0,\"y\":0,\"width\":10,\"height\":10,\"text\":\"x\"}", "'page' must be 1");
         cases.put("{" + BOX + "}", "give 'text', 'image' or both");
         cases.put("{" + BOX + ",\"text\":\"  \"}", "'text' is empty");
@@ -358,5 +453,107 @@ class VisibleSignatureTest {
         DssError e = fails(DssError.Code.INVALID_ARGUMENT, () -> engine.prepareSignature(signed,
                 options("\"visible\":{\"field\":\"Firma1\",\"text\":\"Secondo\"}")));
         assertMessage(e, "'Firma1' is already signed");
+    }
+
+    /**
+     * Fonts that FontBox would accept but that make the subsetter or the cmap parser allocate gigabytes, or
+     * that fail only when the appearance is saved, are refused when the options are parsed.
+     */
+    @Test
+    void craftedFontsAreRefusedWhenTheOptionsAreParsed() {
+        Map<byte[], String> cases = new LinkedHashMap<>();
+        cases.put(CraftedFonts.oversizedLoca(), "ends at byte 2147483632");
+        cases.put(CraftedFonts.reversedLoca(), "negative length in 'loca'");
+        cases.put(CraftedFonts.cmapFormat13(), "format 13");
+        cases.put(CraftedFonts.cmapFormat12Everything(), "map more than");
+        cases.put(CraftedFonts.noSubsetting(), "does not permit subsetting");
+        cases.put(CraftedFonts.noHorizontalMetrics(), "0 horizontal metrics");
+        for (Map.Entry<byte[], String> c : cases.entrySet()) {
+            DssError e = fails(DssError.Code.INVALID_ARGUMENT, () -> options("\"visible\":{" + BOX + ",\"text\":\"x\","
+                    + "\"font\":\"" + b64(c.getKey()) + "\"}"));
+            assertMessage(e, "'font' is not a usable TrueType font");
+            assertMessage(e, c.getValue());
+        }
+    }
+
+    /**
+     * Text that never fits used to be re-wrapped word by word at each of up to 82 shrink steps, with each word
+     * measured together with the whole line so far: a wide box and a long text took tens of seconds before
+     * the INVALID_ARGUMENT. Words are now measured once and wrapping stops as soon as the box overflows.
+     */
+    @Test
+    void textThatNeverFitsIsRefusedQuickly() throws IOException {
+        byte[] wide;
+        try (PDDocument doc = new PDDocument()) {
+            doc.addPage(new PDPage(new PDRectangle(14400, 14400)));
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
+            doc.save(out);
+            wide = out.toByteArray();
+        }
+        String words = "ab ".repeat(VisibleSignature.MAX_TEXT_LENGTH / 3).trim();
+        long start = System.nanoTime();
+        // 2 points of inner height: not even one line fits, at any size, and every size step would otherwise
+        // wrap the whole text into a few very long lines
+        DssError e = fails(DssError.Code.INVALID_ARGUMENT, () -> engine.prepareSignature(wide, options("\"visible\":{"
+                + "\"page\":1,\"x\":0,\"y\":0,\"width\":14000,\"height\":8,\"text\":\"" + words + "\"}")));
+        long ms = (System.nanoTime() - start) / 1_000_000;
+        assertMessage(e, "does not fit in the box");
+        assertTrue(ms < 5000, "refused after " + ms + " ms (tens of seconds before the fix)");
+    }
+
+    /**
+     * PDF/A allows DeviceRGB only with an RGB output intent or a DefaultRGB colour space. A PDF that already has
+     * a non-RGB intent (a CMYK print profile) keeps it, and the appearance declares DefaultRGB = sRGB instead.
+     * A PDF without any intent gets the sRGB one, and needs nothing else.
+     */
+    @Test
+    void aPdfWithANonRgbOutputIntentGetsADefaultRgbInTheAppearance() throws IOException {
+        byte[] cmyk;
+        try (PDDocument doc = Loader.loadPDF(pdf)) {
+            // built at COS level: PDOutputIntent's stream constructor parses the profile through AWT
+            PDStream profile = new PDStream(doc, new ByteArrayInputStream(new byte[128]), COSName.FLATE_DECODE);
+            profile.getCOSObject().setInt(COSName.N, 4);
+            COSDictionary intent = new COSDictionary();
+            intent.setItem(COSName.TYPE, COSName.OUTPUT_INTENT);
+            intent.setItem(COSName.S, COSName.GTS_PDFA1);
+            intent.setString(COSName.OUTPUT_CONDITION_IDENTIFIER, "FOGRA39");
+            intent.setString(COSName.INFO, "Coated FOGRA39 (ISO 12647-2:2004)");
+            intent.setItem(COSName.DEST_OUTPUT_PROFILE, profile);
+            doc.getDocumentCatalog().addOutputIntent(new PDOutputIntent(intent));
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
+            doc.save(out);
+            cmyk = out.toByteArray();
+        }
+        String visible = "\"visible\":{" + BOX + ",\"text\":\"Approvato\",\"text_color\":\"#C00000\"}";
+        COSArray defaultRgb = defaultRgb(sign(cmyk, options(visible), "cmyk-intent"));
+        assertNotNull(defaultRgb, "a DefaultRGB colour space in the appearance's resources");
+        assertEquals(COSName.ICCBASED, defaultRgb.get(0));
+        COSStream profile = (COSStream) defaultRgb.getObject(1);
+        assertEquals(3, profile.getInt(COSName.N));
+        assertEquals(COSName.DEVICERGB, profile.getItem(COSName.ALTERNATE));
+        try (PDDocument doc = Loader.loadPDF(cmyk)) {
+            assertEquals(1, doc.getDocumentCatalog().getOutputIntents().size(), "the CMYK intent is kept alone");
+        }
+        assertEquals(null, defaultRgb(sign(pdf, options(visible), "srgb-intent")), "an sRGB intent is enough");
+    }
+
+    /** The {@code DefaultRGB} entry of the signed widget's appearance resources, or null. */
+    private static COSArray defaultRgb(byte[] signed) throws IOException {
+        try (PDDocument doc = Loader.loadPDF(signed)) {
+            for (PDField f : doc.getDocumentCatalog().getAcroForm().getFieldTree()) {
+                if (f instanceof PDSignatureField s && s.getSignature() != null) {
+                    PDResources resources = s.getWidgets().get(0).getAppearance().getNormalAppearance()
+                            .getAppearanceStream().getResources();
+                    COSDictionary colorSpaces = resources.getCOSObject().getCOSDictionary(COSName.COLORSPACE);
+                    COSArray array = colorSpaces == null ? null : colorSpaces.getCOSArray(COSName.getPDFName(
+                            "DefaultRGB"));
+                    if (array != null) {
+                        array.getObject(1); // resolve the indirect profile stream while the document is open
+                    }
+                    return array;
+                }
+            }
+            throw new AssertionError("no signed field");
+        }
     }
 }

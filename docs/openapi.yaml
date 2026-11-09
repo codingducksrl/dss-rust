@@ -5,7 +5,7 @@ info:
   description: |
     `dss-server` serves one EU DSS engine (libdssnative) to applications in other languages: validate CAdES and
     PAdES signatures, extend PAdES signatures to T, LT or LTA, and sign with a key held elsewhere. Guide:
-    [docs/server.md](https://github.com/codingduck/dss-native/blob/main/docs/server.md).
+    [docs/server.md](https://github.com/codingducksrl/dss-rust/blob/main/docs/server.md).
 
     - Requests that carry a document are `multipart/form-data`. The `options` part is the library's
       `options_json`: unknown keys are refused, and enumerated values are accepted in any case (the canonical
@@ -13,7 +13,13 @@ info:
     - JSON results are the library's own and may gain fields. A signature that fails validation is a 200 result:
       check `signatures[].indication`.
     - Documents come back as the response body, with the result JSON in the `Dss-Result` header.
-    - Every error is `{"ok":false,"error":{"code","message"}}`. New error codes may be added.
+    - Every error is `{"ok":false,"error":{"code","message"}}`, 405 (a known path with the wrong method, with an
+      `Allow` header) included. With a token, a wrong-method request on a guarded path meets the token check
+      first (401 before 405). New error codes may be added.
+    - Admission control: at most `--max-in-flight` document requests are processed at once (503 `SERVER_BUSY`
+      with `Retry-After` beyond that), and a request may take at most `--request-timeout` (504 `TIMEOUT`). A
+      request abandoned before its answer (deadline passed, client disconnected) has its engine call skipped
+      if it is still queued; one already running completes in the background.
 
     The server's own copy of this document is at `/openapi.yaml`, with `info.version` set to its version.
   version: 0.0.0-dev
@@ -62,7 +68,11 @@ paths:
                   $ref: '#/components/schemas/ValidateOptions'
                 detached:
                   type: array
-                  description: Signed content of a detached signature (`.p7s`); the part's filename is its name.
+                  description: >
+                    Signed content of a detached signature (`.p7s`); the part's filename is its name,
+                    `detached-<n>` without one. Passed to the library as binary buffers, placed before any
+                    `detached_contents` entry of the options; at most 1024 parts, none empty
+                    (`INVALID_ARGUMENT`).
                   items:
                     type: string
                     format: binary
@@ -80,6 +90,8 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
         '413':
           $ref: '#/components/responses/RequestTooLarge'
         '422':
@@ -88,6 +100,8 @@ paths:
           $ref: '#/components/responses/InternalError'
         '503':
           $ref: '#/components/responses/Unavailable'
+        '504':
+          $ref: '#/components/responses/Timeout'
   /extend:
     post:
       tags: [Signatures]
@@ -96,10 +110,14 @@ paths:
       description: >
         Extends every signature of a PDF to PAdES-BASELINE-T, -LT or -LTA. The result is the input PDF followed
         by an incremental update, so the original signatures stay valid. LT embeds the certificates and
-        revocation data the signatures need; T and LTA add a document timestamp from the server's TSA. DSS checks
-        the signatures first and refuses with `EXTENSION_FAILED` when one does not validate, a certificate is
-        revoked or expired, revocation data is missing, a signature is already at a higher level, or a timestamp
-        is needed and no TSA is configured.
+        revocation data the signatures need; T and LTA add a document timestamp from the server's TSA. A B-level
+        signature extended to LT needs the TSA too: it gets a timestamp first. DSS checks the signatures first
+        and refuses with `EXTENSION_FAILED` when one does not validate, a certificate is revoked or expired,
+        revocation data is missing, every signature is already at a higher level than the target, or a
+        timestamp is needed and no TSA is configured; a TSA that cannot be reached or answers badly is
+        `TSA_FAILED`. Known DSS issue: on a PDF with a signed field whose `/Lock` restricts all fields (FieldMDP
+        `Action=All`), DSS 6.5.1 reports the document timestamp its own LTA extension adds as a change the lock
+        forbids (a `FieldMDP` / `SigFieldLock` warning when the result is validated); the verdict is unaffected.
       requestBody:
         required: true
         content:
@@ -132,14 +150,20 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
         '413':
           $ref: '#/components/responses/RequestTooLarge'
         '422':
           $ref: '#/components/responses/Unprocessable'
         '500':
           $ref: '#/components/responses/InternalError'
+        '502':
+          $ref: '#/components/responses/TsaFailed'
         '503':
           $ref: '#/components/responses/Unavailable'
+        '504':
+          $ref: '#/components/responses/Timeout'
   /sign/prepare:
     post:
       tags: [Signatures]
@@ -147,8 +171,12 @@ paths:
       summary: 'Signing, step 1: the digest for the external signer'
       description: >
         Returns the digest the external signer must sign, and the signing time the signature will claim. Needs no
-        network and no trusted lists. Refuses a signing certificate that is expired or not yet valid at the
-        signing time. Nothing is kept on the server: step 2 may run much later, on another instance.
+        network and no trusted lists. Refuses (`SIGNING_FAILED`) a signing certificate that is expired or not
+        yet valid at the signing time, or not meant for signing documents (a CA certificate, key usage, extended
+        key usage), when `signing_certificate` is given; for PAdES at LT or LTA (and at T in mode `cms`) also a
+        PDF whose existing signatures DSS would refuse to extend; and (`INVALID_ARGUMENT`, mode `signature_value`)
+        a `pades.content_size` the CMS built around the signature value cannot fit, before the signer is asked.
+        Nothing is kept on the server: step 2 may run much later, on another instance.
       requestBody:
         required: true
         content:
@@ -177,6 +205,8 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
         '413':
           $ref: '#/components/responses/RequestTooLarge'
         '422':
@@ -185,6 +215,8 @@ paths:
           $ref: '#/components/responses/InternalError'
         '503':
           $ref: '#/components/responses/Unavailable'
+        '504':
+          $ref: '#/components/responses/Timeout'
   /sign/complete:
     post:
       tags: [Signatures]
@@ -194,7 +226,12 @@ paths:
         Builds the signed document from what the external signer returned, and adds the level asked for. Send the
         same document and options as to `/sign/prepare`, with `signing_time` set to the one it returned: anything
         else gives another digest, and the signature is refused (`SIGNING_FAILED`, "not this document's
-        digest").
+        digest"). In mode `cms` the CMS must be a baseline-B detached CMS over the digest, signed with the digest
+        algorithm of the options by the certificate it carries and references, with no unsigned attribute other
+        than one verified signature timestamp (README.md, "Signing with an external signer"). In mode
+        `signature_value` a `pades.content_size` too small for the CMS is `INVALID_ARGUMENT`, as in
+        `/sign/prepare`; a CMS that does not fit for a reason outside that estimate (the level-T timestamp) is
+        `SIGNING_FAILED`.
       requestBody:
         required: true
         content:
@@ -245,14 +282,20 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
         '413':
           $ref: '#/components/responses/RequestTooLarge'
         '422':
           $ref: '#/components/responses/Unprocessable'
         '500':
           $ref: '#/components/responses/InternalError'
+        '502':
+          $ref: '#/components/responses/TsaFailed'
         '503':
           $ref: '#/components/responses/Unavailable'
+        '504':
+          $ref: '#/components/responses/Timeout'
   /tl/status:
     get:
       tags: [Trusted lists]
@@ -268,6 +311,8 @@ paths:
                 $ref: '#/components/schemas/TrustedListStatus'
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
         '500':
           $ref: '#/components/responses/InternalError'
         '503':
@@ -278,20 +323,23 @@ paths:
       operationId: refreshTrustedLists
       summary: Start an online refresh
       description: >
-        Starts downloading and validating the LOTL and national trusted lists, and answers at once.
-        `/tl/status` shows the progress (`refresh_in_progress`) and the outcome (`last_online_refresh`). Requests
-        keep being served during the refresh, against the previous lists.
+        Asks for the LOTL and national trusted lists to be downloaded and validated as soon as possible, and
+        answers at once. `/tl/status` shows the progress (`refresh_in_progress`, which can lag the 202 by a few
+        milliseconds) and the outcome (`last_online_refresh`). Requests keep being served during the refresh,
+        against the previous lists. The caller's address is logged.
       responses:
         '202':
-          description: The refresh started.
+          description: The refresh starts as soon as possible (or is running and will serve this request too).
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Accepted'
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
         '409':
-          description: A refresh is already running.
+          description: A refresh is already running or requested; its outcome serves this request too.
           content:
             application/json:
               schema:
@@ -300,9 +348,13 @@ paths:
                 ok: false
                 error:
                   code: REFRESH_IN_PROGRESS
-                  message: an online refresh is already running
+                  message: an online refresh is already running or requested
         '500':
-          $ref: '#/components/responses/InternalError'
+          description: '`INTERNAL_ERROR`: the refresh schedule has died; restart the server.'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '503':
           $ref: '#/components/responses/Unavailable'
   /version:
@@ -319,6 +371,8 @@ paths:
                 $ref: '#/components/schemas/Version'
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
         '500':
           $ref: '#/components/responses/InternalError'
         '503':
@@ -328,22 +382,26 @@ paths:
       tags: [Server]
       operationId: health
       summary: Readiness
-      description: 200 once the engine is up, 503 while it starts. For container health checks; needs no token.
+      description: >
+        200 once the server can validate: the engine is up and, unless it runs with
+        `--allow-without-trusted-lists`, its trusted lists are loaded. 503 while it starts
+        (`starting`) or waits for the lists (`waiting_for_trusted_lists`). For container health checks;
+        needs no token.
       security: []
       responses:
         '200':
-          description: The engine is up.
+          description: The server can validate.
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Health'
         '503':
-          description: The engine is starting.
+          description: The engine is starting, or has no trusted lists yet while validation needs them.
           content:
             application/json:
               schema:
                 oneOf:
-                  - $ref: '#/components/schemas/Starting'
+                  - $ref: '#/components/schemas/NotReady'
                   - $ref: '#/components/schemas/Error'
   /openapi.yaml:
     get:
@@ -386,7 +444,8 @@ components:
     BadRequest:
       description: >
         `INVALID_ARGUMENT`: not multipart, a missing, repeated or unexpected part, options that are not a JSON
-        object, an unknown option or a bad value.
+        object, an unknown option or a bad value (a `pades.content_size` the signature's CMS cannot fit
+        included).
       content:
         application/json:
           schema:
@@ -398,6 +457,11 @@ components:
               message: "missing part 'document'"
     Unauthorized:
       description: '`UNAUTHORIZED`: the server runs with a token, and the request has none or another.'
+      headers:
+        WWW-Authenticate:
+          description: '`Bearer`, or `Bearer error="invalid_token"` when a token was sent.'
+          schema:
+            type: string
       content:
         application/json:
           schema:
@@ -407,8 +471,32 @@ components:
             error:
               code: UNAUTHORIZED
               message: missing or wrong bearer token
+    Forbidden:
+      description: >
+        `FORBIDDEN`: the server runs without a token, and the request carries an `Origin` header (a browser
+        made it on behalf of a web page). Run the server with a token if a page must call it.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
     RequestTooLarge:
       description: '`REQUEST_TOO_LARGE`: the request is over the server''s `--max-request-mb`.'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    TsaFailed:
+      description: >
+        `TSA_FAILED`: the server's timestamping service could not be reached, answered an HTTP error (retry
+        later) or returned a token the engine refuses.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Timeout:
+      description: >
+        `TIMEOUT`: the request took longer than the server's `--request-timeout`, upload included. An engine call
+        still queued is skipped; one already running finishes in the background, so do not retry at once.
       content:
         application/json:
           schema:
@@ -429,7 +517,7 @@ components:
               message: not a PDF or CMS/CAdES document (also tried base64 and PEM decoding)
     InternalError:
       description: >
-        `INTERNAL_ERROR` (anything unexpected in the library, including running out of heap) or `INVALID_CONFIG`.
+        `INTERNAL_ERROR`: anything unexpected in the library, including running out of heap.
       content:
         application/json:
           schema:
@@ -437,7 +525,14 @@ components:
     Unavailable:
       description: >
         `NOT_INITIALIZED`: the engine is starting; retry shortly. `TRUSTED_LISTS_NOT_LOADED`: no trusted list is
-        loaded yet (the first online refresh is still running).
+        loaded yet (the first online refresh is still running or failed, or none is scheduled: `POST /tl/refresh`).
+        `SERVER_BUSY`: `--max-in-flight` requests are already being processed; the body was not read, retry after
+        `Retry-After` seconds.
+      headers:
+        Retry-After:
+          description: '`SERVER_BUSY` only: seconds to wait.'
+          schema:
+            type: integer
       content:
         application/json:
           schema:
@@ -461,10 +556,13 @@ components:
             code:
               type: string
               description: >
-                The library's: `INVALID_ARGUMENT`, `INVALID_CONFIG`, `NOT_INITIALIZED`, `TRUSTED_LISTS_NOT_LOADED`,
-                `REFRESH_IN_PROGRESS`, `TL_REFRESH_FAILED`, `UNSUPPORTED_DOCUMENT`, `VALIDATION_FAILED`,
-                `EXTENSION_FAILED`, `SIGNING_FAILED`, `INTERNAL_ERROR`. The server's: `UNAUTHORIZED`, `NOT_FOUND`,
-                `REQUEST_TOO_LARGE`. New codes may be added.
+                The library's: `INVALID_ARGUMENT`, `NOT_INITIALIZED`, `TRUSTED_LISTS_NOT_LOADED`,
+                `REFRESH_IN_PROGRESS`, `UNSUPPORTED_DOCUMENT`, `VALIDATION_FAILED`, `EXTENSION_FAILED`,
+                `SIGNING_FAILED`, `TSA_FAILED`, `INTERNAL_ERROR`. The server's: `UNAUTHORIZED`, `FORBIDDEN`,
+                `NOT_FOUND`, `METHOD_NOT_ALLOWED`, `REQUEST_TOO_LARGE`, `SERVER_BUSY`, `TIMEOUT`. The library's
+                other codes (`INVALID_CONFIG`, `TL_SNAPSHOT_REJECTED`) stop the server at start-up, and
+                `TL_REFRESH_FAILED` is only logged (a refresh runs after its 202), so no response carries them.
+                New codes may be added.
               examples: [EXTENSION_FAILED]
             message:
               type: string
@@ -483,8 +581,8 @@ components:
         detached_contents:
           type: array
           description: >
-            Signed content of a detached signature, as base64. The `detached` part is the other way to send it; a
-            `path` is refused.
+            Signed content of a detached signature, as base64. The `detached` part is the other way to send it
+            (binary, listed before these entries); a `path` is refused.
           items:
             $ref: '#/components/schemas/DetachedContent'
         validation_time:
@@ -551,8 +649,8 @@ components:
           type: string
           format: date-time
           description: >
-            Whole seconds, UTC. `/sign/prepare`: default now. `/sign/complete`: required, as `/sign/prepare`
-            returned it.
+            Whole seconds, UTC. `/sign/prepare`: default now. `/sign/complete`: as `/sign/prepare` returned it;
+            required for PAdES and for `signature_value` (only CAdES in `cms` mode completes without it).
           examples: ['2026-10-28T10:15:30Z']
         signing_certificate:
           type: string
@@ -589,7 +687,12 @@ components:
         content_size:
           type: integer
           minimum: 1
-          description: Bytes reserved for the CMS. Default 32768 (`cms`), 9472 (`signature_value`).
+          maximum: 1048576
+          description: >
+            Bytes reserved for the CMS. Default 32768 (`cms`), 9472 (`signature_value`). In mode
+            `signature_value` a size the CMS (signed attributes, signature value, certificates) cannot fit is
+            refused as `INVALID_ARGUMENT` by `/sign/prepare` already; the level-T timestamp is outside that
+            estimate.
         visible:
           $ref: '#/components/schemas/VisibleSignature'
     VisibleSignature:
@@ -600,35 +703,60 @@ components:
       additionalProperties: false
       oneOf:
         - required: [field]
+          not:
+            anyOf:
+              - required: [page]
+              - required: [x]
+              - required: [y]
+              - required: [width]
+              - required: [height]
         - required: [page, x, y, width, height]
+          not:
+            required: [field]
+      anyOf:
+        - required: [text]
+        - required: [image]
+      dependentRequired:
+        font: [text]
       properties:
         field:
           type: string
-          description: An empty signature field of the PDF, by name.
+          description: An empty signature field of the PDF, by name (not with a position). Hidden or NoView fields are refused.
         page:
           type: integer
           minimum: 1
         x:
           type: number
+          minimum: 0
+          maximum: 14400
           description: Points (1/72 inch) from the left edge of the page as displayed.
         y:
           type: number
+          minimum: 0
+          maximum: 14400
           description: Points from the top edge of the page as displayed.
         width:
           type: number
           exclusiveMinimum: 0
+          maximum: 14400
         height:
           type: number
           exclusiveMinimum: 0
+          maximum: 14400
         text:
           type: string
+          minLength: 1
+          maxLength: 10000
           description: >
             Lines separated by `\n`. Placeholders `{signer_name}`, `{signing_time}`, `{reason}`, `{location}`;
-            `{{` and `}}` for literal braces.
+            `{{` and `}}` for literal braces. Not blank, also once the placeholders are filled in. `text`,
+            `image` or both.
         font:
           type: string
           contentEncoding: base64
-          description: A TrueType font (TTF, or OTF with TrueType outlines). Default PT Serif.
+          description: >
+            A TrueType font (TTF, or OTF with TrueType outlines; not a collection or CFF, at most 32 MB, whose
+            licence allows subsetting). Needs `text`. Default PT Serif.
         font_size:
           type: number
           minimum: 4
@@ -649,7 +777,9 @@ components:
         image:
           type: string
           contentEncoding: base64
-          description: A PNG or a JPEG, up to 25 megapixels.
+          description: >
+            A PNG or a JPEG, up to 25 megapixels and 16384 pixels on each side, stored upright (a JPEG with an
+            Exif orientation other than 1 is refused). `text`, `image` or both.
         image_position:
           enum: [left, right, top, bottom, behind]
           default: left
@@ -673,6 +803,12 @@ components:
       type: object
       required: [container, signatures, simple_report_xml]
       properties:
+        all_passed:
+          type: boolean
+          description: >
+            True only when the document has at least one signature and every signature, at every nesting level,
+            is `TOTAL_PASSED`; false for an unsigned or timestamp-only document. Ignores warnings and
+            `modified_after_signing`. Top level only.
         container:
           enum: [PDF, CMS]
         transformations:
@@ -685,6 +821,11 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/SignatureSummary'
+        timestamps:
+          type: array
+          description: Standalone document timestamps (not belonging to a signature).
+          items:
+            $ref: '#/components/schemas/TimestampSummary'
         simple_report_xml:
           type: string
         detailed_report_xml:
@@ -698,7 +839,9 @@ components:
           description: When requested.
         nested:
           type: array
-          description: The validation of a CAdES envelope inside the signed content (`.p7m.p7m`).
+          description: >
+            The validation of a CAdES envelope inside the signed content (`.p7m.p7m`), or of a signed PDF inside
+            a CAdES envelope (`.pdf.p7m`).
           items:
             $ref: '#/components/schemas/Reports'
     SignatureSummary:
@@ -730,6 +873,111 @@ components:
         signer_dn:
           type: [string, 'null']
           description: Subject DN of the signing certificate (RFC 2253).
+        trust_anchor:
+          type: [string, 'null']
+          enum: [trusted_list, extra_trusted_certificates, none, null]
+          description: Where the chain was anchored.
+        errors:
+          type: array
+          description: AdES validation messages (qualification messages are in `qualification_errors`).
+          items:
+            type: string
+        warnings:
+          type: array
+          items:
+            type: string
+        qualification_errors:
+          type: array
+          items:
+            type: string
+        qualification_warnings:
+          type: array
+          items:
+            type: string
+        info:
+          type: array
+          items:
+            type: string
+        policy:
+          description: Only when the signature claims a signature policy.
+          oneOf:
+            - $ref: '#/components/schemas/Policy'
+            - type: 'null'
+        modified_after_signing:
+          type: [boolean, 'null']
+          description: PAdES only. Whether the PDF was changed after this signature (details in `changes_after_signing`).
+        changes_after_signing:
+          description: PAdES only.
+          oneOf:
+            - $ref: '#/components/schemas/Changes'
+            - type: 'null'
+        timestamps:
+          type: array
+          description: The signature's own timestamps.
+          items:
+            $ref: '#/components/schemas/TimestampSummary'
+    Policy:
+      type: object
+      properties:
+        id:
+          type: [string, 'null']
+        url:
+          type: [string, 'null']
+        identified:
+          type: [boolean, 'null']
+        digest_valid:
+          type: [boolean, 'null']
+    Changes:
+      type: object
+      description: >
+        Incremental updates found after a signature, by kind. Known DSS issue: on a PDF with a signed field whose
+        `/Lock` restricts all fields (FieldMDP `Action=All`), DSS 6.5.1 reports the document timestamp its own
+        LTA extension adds as a change the lock forbids (a `FieldMDP` / `SigFieldLock` warning in the reports);
+        the verdict and `modified_after_signing` are unaffected.
+      properties:
+        extension:
+          type: integer
+        signature_or_form_fill:
+          type: integer
+        annotation:
+          type: integer
+        undefined:
+          type: integer
+        pages_differ:
+          type: array
+          description: Pages (1-based) added or removed after the signed revision.
+          items:
+            type: integer
+        annotations_overlap:
+          type: array
+          description: Pages where an added annotation overlaps a signature's appearance.
+          items:
+            type: integer
+        active_content:
+          type: array
+          description: Object paths of active content (JavaScript, actions) added.
+          items:
+            type: string
+    TimestampSummary:
+      type: object
+      required: [id]
+      properties:
+        id:
+          type: string
+        type:
+          type: [string, 'null']
+          examples: [DOCUMENT_TIMESTAMP]
+        indication:
+          type: [string, 'null']
+        sub_indication:
+          type: [string, 'null']
+        production_time:
+          type: [string, 'null']
+          format: date-time
+        produced_by:
+          type: [string, 'null']
+        qualification:
+          type: [string, 'null']
         errors:
           type: array
           items:
@@ -797,8 +1045,26 @@ components:
           const: true
         loaded:
           type: boolean
+        oj_keystore:
+          type: object
+          description: >
+            The root of trust in use, present once the engine has started (before any refresh): the OJ keystore
+            holding the LOTL signing certificates, and a digest over them (SHA-256 of their sorted SHA-256
+            digests, 64 lowercase hex digits) that a trusted-list snapshot records as
+            `settings.oj_keystore_sha256`, so a snapshot's provenance can be checked against the running server.
+          required: [path, sha256]
+          properties:
+            path:
+              type: string
+              description: The keystore's path as the server was configured with.
+            sha256:
+              type: string
+              pattern: '^[0-9a-f]{64}$'
         trusted_certificates:
           type: integer
+        extra_trusted_certificates:
+          type: integer
+          description: Trust anchors loaded from the server's `--trust` files.
         snapshot_published_at:
           type: [string, 'null']
           format: date-time
@@ -840,6 +1106,11 @@ components:
           oneOf:
             - $ref: '#/components/schemas/RefreshRecord'
             - type: 'null'
+        countries_unmatched:
+          type: array
+          description: Configured countries (`--country`) matching no list in the LOTL.
+          items:
+            type: string
         lotls:
           type: array
           items:
@@ -868,9 +1139,16 @@ components:
           format: date-time
         duration_ms:
           type: integer
+          minimum: 0
+          description: >
+            Measured on a monotonic clock, so never negative even if the system clock steps backwards during
+            the refresh; `started_at` and `finished_at` are wall-clock times and may then appear out of order.
         completed:
           type: boolean
-          description: False only if the refresh could not run at all; per-list problems are in the lists' state.
+          description: >
+            False when the refresh published nothing (it could not run, or what it built was unusable: the LOTL
+            not downloadable, badly signed, every national list undownloadable); the lists loaded before are
+            kept and `error` says why. Per-list problems of a published refresh are in the lists' state.
         error:
           type: [string, 'null']
         trusted_certificates:
@@ -886,6 +1164,12 @@ components:
           type: [string, 'null']
         sequence_number:
           type: [integer, 'null']
+        last_published_sequence_number:
+          type: [integer, 'null']
+          description: >
+            The floor the rollback protection enforces for this URL: the sequence number of the list last
+            published from it (kept in `<cache_dir>/tl-sequence-numbers.json`, never lowered). Null when nothing
+            has been published for it yet.
         version:
           type: [integer, 'null']
         issue_date:
@@ -905,6 +1189,11 @@ components:
         used_for_trust:
           type: [boolean, 'null']
           description: Whether its certificates are trust anchors.
+        structure_messages:
+          type: array
+          description: DSS's structure validation messages for the list, usually empty.
+          items:
+            type: string
         download:
           $ref: '#/components/schemas/Stage'
         parsing:
@@ -917,7 +1206,11 @@ components:
             $ref: '#/components/schemas/ListStatus'
     Stage:
       type: object
-      description: Download, parsing or signature-validation state of a list.
+      description: >
+        Download, parsing or signature-validation state of a list. A list refused by the rollback protection (an
+        older one than the last published for its URL, downloaded or read from the cache) shows as a download
+        `ERROR` whose `error` starts with "rollback refused:", with a `tl_rollback` alert; the list used before
+        stays in use.
       properties:
         status:
           type: [string, 'null']
@@ -947,11 +1240,18 @@ components:
           type: [string, 'null']
     Alert:
       type: object
+      description: One entry per type and list; `count` says how often it was seen.
       required: [type, message, at]
       properties:
         type:
           type: string
-          description: '`oj_url_changed`, `lotl_location_changed`, `tl_signature_error` or `tl_expired`.'
+          description: >
+            `oj_url_changed`, `lotl_location_changed`, `tl_signature_error`, `tl_expired`,
+            `tl_structure_error`, `lotl_signature_error`, `lotl_expired`, `lotl_structure_error`,
+            `refresh_not_published`, `cache_write_error` (one per list that could not be stored in the cache,
+            `url` = the list; without a `url`, the sequence-number file of the rollback protection could not be
+            written), `countries_unmatched` or `tl_rollback` (a list older than the one last published from
+            `url` was refused; the `*sequence_number` and `*issue_date` fields say which).
         url:
           type: [string, 'null']
         message:
@@ -959,6 +1259,29 @@ components:
         at:
           type: string
           format: date-time
+          description: When it was last seen.
+        first_seen:
+          type: [string, 'null']
+          format: date-time
+        last_seen:
+          type: [string, 'null']
+          format: date-time
+        count:
+          type: [integer, 'null']
+        previous_sequence_number:
+          type: integer
+          description: '`tl_rollback` only: the sequence number of the list published from `url` (the floor).'
+        previous_issue_date:
+          type: string
+          format: date-time
+          description: '`tl_rollback` only: when that published list was issued.'
+        sequence_number:
+          type: integer
+          description: '`tl_rollback` only: the sequence number of the refused list.'
+        issue_date:
+          type: [string, 'null']
+          format: date-time
+          description: '`tl_rollback` only: when the refused list was issued, when it says.'
     Accepted:
       type: object
       required: [ok]
@@ -980,9 +1303,12 @@ components:
           examples: [6.5.1]
         runtime:
           type: string
+        api_version:
+          type: [integer, 'null']
+          description: The library's C API version (null for a library that predates it).
     Health:
       type: object
-      required: [ok, status, trusted_lists_loaded, refresh_in_progress]
+      required: [ok, status, trusted_lists_loaded, refresh_in_progress, in_flight, max_in_flight]
       properties:
         ok:
           const: true
@@ -992,11 +1318,36 @@ components:
           type: boolean
         refresh_in_progress:
           type: boolean
-    Starting:
+        last_online_refresh:
+          oneOf:
+            - $ref: '#/components/schemas/RefreshRecord'
+            - type: 'null'
+        in_flight:
+          type: integer
+          description: Document requests being read or processed now.
+        max_in_flight:
+          type: integer
+          description: The server's `--max-in-flight`.
+    NotReady:
       type: object
       required: [ok, status]
       properties:
         ok:
           const: false
         status:
-          const: starting
+          enum: [starting, waiting_for_trusted_lists]
+          description: >
+            `starting`: the engine is not up yet (no other field). `waiting_for_trusted_lists`: it is up, but
+            validation needs the trusted lists and none is loaded; the other fields are as in the 200 answer.
+        trusted_lists_loaded:
+          type: boolean
+        refresh_in_progress:
+          type: boolean
+        last_online_refresh:
+          oneOf:
+            - $ref: '#/components/schemas/RefreshRecord'
+            - type: 'null'
+        in_flight:
+          type: integer
+        max_in_flight:
+          type: integer

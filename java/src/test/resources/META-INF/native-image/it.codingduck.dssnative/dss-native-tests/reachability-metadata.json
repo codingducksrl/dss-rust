@@ -18,6 +18,10 @@
         {
           "name": "structureDifferencesAreDetected",
           "parameterTypes": []
+        },
+        {
+          "name": "theReasonForARejectionIsCompared",
+          "parameterTypes": []
         }
       ]
     },
@@ -57,6 +61,18 @@
         {
           "name": "tearDown",
           "parameterTypes": []
+        },
+        {
+          "name": "nonDocuments",
+          "parameterTypes": []
+        },
+        {
+          "name": "inputDetectionMatchesTheEngine",
+          "parameterTypes": [
+            "java.lang.String",
+            "byte[]",
+            "java.lang.String"
+          ]
         }
       ]
     },
@@ -390,6 +406,100 @@
     },
     {
       "type": "it.codingduck.dssnative.engine.OnlineTrustedListTest"
+    },
+    {
+      "type": "it.codingduck.dssnative.engine.PivotSupportTest",
+      "fields": [
+        {
+          "name": "tmp"
+        }
+      ],
+      "methods": [
+        {
+          "name": "<init>",
+          "parameterTypes": []
+        },
+        {
+          "name": "serveAPivotChain",
+          "parameterTypes": []
+        },
+        {
+          "name": "pivotSupportFollowsTheChainToASignerOutsideTheOjKeystore",
+          "parameterTypes": []
+        },
+        {
+          "name": "theChainIsKeptInTheCacheAndFollowedOffline",
+          "parameterTypes": []
+        },
+        {
+          "name": "withoutPivotSupportTheLotlSignerIsNotTrusted",
+          "parameterTypes": []
+        },
+        {
+          "name": "aChainNotStartingAtTheOjKeystoreIsNotFollowed",
+          "parameterTypes": []
+        }
+      ]
+    },
+    {
+      "type": "it.codingduck.dssnative.engine.RevocationLoopbackTest",
+      "fields": [
+        {
+          "name": "tmp"
+        }
+      ],
+      "methods": [
+        {
+          "name": "<init>",
+          "parameterTypes": []
+        },
+        {
+          "name": "startServer",
+          "parameterTypes": []
+        },
+        {
+          "name": "stopServer",
+          "parameterTypes": []
+        },
+        {
+          "name": "ocspCrlAndAiaAreFetchedOverHttpAndEmbeddedByTheExtension",
+          "parameterTypes": []
+        },
+        {
+          "name": "aSignerRevokedOnOcspIsReportedRevoked",
+          "parameterTypes": []
+        },
+        {
+          "name": "anOcspAnswerWithAnotherNonceIsRefusedAndTheCrlDecides",
+          "parameterTypes": []
+        },
+        {
+          "name": "anOcspResponderErrorFallsBackToTheCrl",
+          "parameterTypes": []
+        },
+        {
+          "name": "revocationOfflineMakesNoRequest",
+          "parameterTypes": []
+        }
+      ]
+    },
+    {
+      "type": "it.codingduck.dssnative.engine.SignaturePolicyTest",
+      "fields": [
+        {
+          "name": "tmp"
+        }
+      ],
+      "methods": [
+        {
+          "name": "<init>",
+          "parameterTypes": []
+        },
+        {
+          "name": "theDocumentsPolicyUrlIsNeverFetched",
+          "parameterTypes": []
+        }
+      ]
     },
     {
       "type": "it.codingduck.dssnative.engine.SigningTest",

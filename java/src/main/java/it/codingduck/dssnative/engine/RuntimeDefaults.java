@@ -12,8 +12,8 @@ import java.util.Locale;
  * host process's environment.
  *
  * <p>Locale: JDK date/number formatting used inside DSS and JAXB loads CLDR locale data reflectively for the
- * default locale. The native image only carries {@code en-US} (see {@code -H:DefaultLocale} in
- * native-image.properties), so a host running with, say, {@code LANG=it_IT} would otherwise hit a
+ * default locale. The native image only carries {@code en-US} (see {@code -Duser.language}/{@code -Duser.country}
+ * in native-image.properties), so a host running with, say, {@code LANG=it_IT} would otherwise hit a
  * {@code MissingReflectionRegistrationError}. Including every locale instead costs about 50 MB.
  * Reports are English anyway ({@code Locale.ENGLISH} is set on each validator).
  *

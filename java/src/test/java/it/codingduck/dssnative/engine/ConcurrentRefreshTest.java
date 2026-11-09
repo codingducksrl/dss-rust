@@ -26,11 +26,15 @@ import org.junit.jupiter.api.io.TempDir;
 import it.codingduck.dssnative.testsupport.Fixtures;
 import it.codingduck.dssnative.testsupport.SyntheticTrustedLists;
 import it.codingduck.dssnative.testsupport.TestEngines;
+import it.codingduck.dssnative.testsupport.TestPki;
 
 /**
  * Validations keep running, with unchanged verdicts, while online refreshes replace the trusted lists. Each
  * refresh serves lists with a new sequence number, so DSS really re-synchronizes its certificate source every
- * time (the case where an in-place update would expose a half-built trust pool).
+ * time (the case where an in-place update would expose a half-built trust pool), and every other refresh drops
+ * the DE list's CA, so the published pools really differ: a half-built or empty pool fails the fixtures (they
+ * all hang off the IT list), and the trusted-certificate count a validator can observe is only ever one of the
+ * two complete pools' counts.
  */
 class ConcurrentRefreshTest {
 
@@ -80,6 +84,10 @@ class ConcurrentRefreshTest {
                             if (!expected.get(name).equals(got)) {
                                 failures.add(name + " -> " + got);
                             }
+                            Object count = engine.trustedListStatus().get("trusted_certificates");
+                            if (!Integer.valueOf(2).equals(count) && !Integer.valueOf(3).equals(count)) {
+                                failures.add("trust pool with " + count + " certificates observed");
+                            }
                         } catch (Throwable e) {
                             failures.add(name + " threw " + e);
                         }
@@ -92,10 +100,11 @@ class ConcurrentRefreshTest {
             t.http.beforeEachRequest(() -> sleep(DOWNLOAD_DELAY_MS));
             int before = validations.get();
             for (int seq = 2; seq < 2 + REFRESHES; seq++) {
-                new SyntheticTrustedLists(t.pki, seq).serveOn(t.http);
+                boolean withDeCa = seq % 2 == 0;
+                new SyntheticTrustedLists(t.pki, seq).withDeCa(withDeCa ? TestPki.Entity.OTHER_CA : null).serveOn(t.http);
                 TrustedListManager.RefreshRecord rec = engine.refreshTrustedListsOnline();
                 assertTrue(rec.completed());
-                assertEquals(3, rec.trustedCertificates());
+                assertEquals(withDeCa ? 3 : 2, rec.trustedCertificates(), "refresh " + seq);
             }
             int during = validations.get() - before;
             stop.set(true);

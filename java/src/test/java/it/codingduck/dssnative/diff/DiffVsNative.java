@@ -53,7 +53,8 @@ public final class DiffVsNative {
             @SuppressWarnings("unchecked")
             Outcome o = Boolean.TRUE.equals(m.get("ok"))
                     ? Outcome.ofJson((Map<String, Object>) m.get("result"))
-                    : Outcome.rejected(String.valueOf(((Map<?, ?>) m.get("error")).get("code")));
+                    : Outcome.rejected(String.valueOf(((Map<?, ?>) m.get("error")).get("code")),
+                            String.valueOf(((Map<?, ?>) m.get("error")).get("message")));
             nativeFiles.add((String) m.get("file"));
             nativeResults.add(o);
         }

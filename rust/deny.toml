@@ -1,0 +1,58 @@
+# SPDX-FileCopyrightText: 2026 Coding Duck
+# SPDX-License-Identifier: LGPL-2.1-or-later
+#
+# cargo-deny policy for the Rust workspace (docs/DECISIONS.md, "Dependency monitoring").
+#
+#   cd rust && cargo deny check
+#
+# CI runs it every week and on every change to Cargo.lock (.github/workflows/security.yml). It reads Cargo.lock
+# only: nothing is built, so it does not need the native library.
+
+[graph]
+# The platforms release packages are built for.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "aarch64-apple-darwin",
+]
+all-features = true
+
+[advisories]
+# RustSec: vulnerabilities fail the check, and so do unmaintained or unsound crates in the workspace's own
+# dependency graph. A yanked version is an error too: Cargo.lock must move off it.
+version = 2
+unmaintained = "workspace"
+unsound = "workspace"
+yanked = "deny"
+ignore = []
+
+[licenses]
+version = 2
+# Licences compatible with distributing dss-cli and dss-server (LGPL-2.1-or-later) and the crates' notices in
+# licenses/rust/ (LICENSING.md, "Rust crates in dss-cli and dss-server"). A crate under any other licence needs a
+# decision in docs/DECISIONS.md before it is added here.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unlicense",
+]
+confidence-threshold = 0.9
+
+[licenses.private]
+# The workspace's own crates (publish = false).
+ignore = true
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+# crates.io only: no git dependencies, no other registry.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

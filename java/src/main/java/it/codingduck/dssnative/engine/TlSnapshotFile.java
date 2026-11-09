@@ -113,8 +113,11 @@ public final class TlSnapshotFile {
     private static final int MAX_DEPTH = 200;
     private static final long MAX_REFERENCES = 50_000_000;
     private static final long MAX_ARRAY_LENGTH = 64L * 1024 * 1024;
-    /** BouncyCastle: skip its primality tests of RSA moduli, on the reading thread only (see {@link #contents}). */
-    private static final String BC_ALLOW_UNSAFE_MOD = "org.bouncycastle.rsa.allow_unsafe_mod";
+    /**
+     * BouncyCastle: skip its primality tests of RSA moduli on the current thread (see {@link #contents}). The
+     * trusted-list threads set it too, for the same reason and with the same safety argument.
+     */
+    static final String BC_ALLOW_UNSAFE_MOD = "org.bouncycastle.rsa.allow_unsafe_mod";
 
     private TlSnapshotFile() {
     }

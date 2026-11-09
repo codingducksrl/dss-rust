@@ -25,22 +25,37 @@ public final class DssError extends RuntimeException {
         TL_REFRESH_FAILED,
         /** The input is neither a PDF nor a CMS/CAdES structure (after base64/PEM unwrapping). */
         UNSUPPORTED_DOCUMENT,
-        /** DSS could not process the document (corrupt structure, unreadable PDF, …). */
+        /**
+         * DSS could not process the document (corrupt structure, unreadable PDF, …), or the document is over one
+         * of the structural {@code limits} (pages, signature revisions, annotations per page, CMS certificates).
+         */
         VALIDATION_FAILED,
         /**
          * DSS refused to extend the signatures or could not (invalid signature, revoked or expired certificate,
-         * missing revocation data, already at a higher level, no TSA configured or the TSA failed, …).
+         * missing revocation data, every signature already at a higher level, no TSA configured, …), or the PDF
+         * is over one of the structural {@code limits}. A failing TSA is {@link #TSA_FAILED}.
          */
         EXTENSION_FAILED,
         /**
          * A signature could not be prepared or completed: the external signature does not match the document and
-         * options (wrong digest, signer or key, or not a usable CMS), the signing certificate is expired or not yet
-         * valid, the CMS does not fit the space reserved in the PDF, or DSS refused to add the requested level (no
-         * TSA configured, the TSA failed, revocation data missing, …).
+         * options (wrong digest, signer or key, or not a usable CMS); the signing certificate, when given in
+         * either mode, is expired or not yet valid at the signing time or is not meant for signing documents (a
+         * CA certificate, a key usage without digitalSignature or nonRepudiation, an extended key usage limited
+         * to timestamping, TLS or OCSP); for PAdES at LT/LTA and at T in mode "cms", the PDF's existing
+         * signatures are ones DSS would refuse to extend; the CMS does not fit the space reserved in the PDF; the
+         * PDF is over one of the structural {@code limits}; or DSS refused to add the requested level (no TSA
+         * configured, revocation data missing, …). A failing TSA is {@link #TSA_FAILED}.
          */
         SIGNING_FAILED,
         /** Anything unexpected, including JVM errors. */
         INTERNAL_ERROR,
+        /**
+         * The configured TSA failed while a timestamp was needed: it could not be reached or answered with an
+         * error (retrying later may help), or it returned a token the engine refuses (not from a timestamping
+         * certificate that chains to the trust anchors, dated far from this host's clock, signed with a weak
+         * algorithm, or not over the digest that was sent). The document itself was not at fault.
+         */
+        TSA_FAILED,
         /**
          * The trusted-list snapshot named by {@code tl_snapshot} cannot be used: unreadable, not a snapshot, corrupt,
          * written by another DSS version or with other trusted-list settings, or holding a list that can no longer be

@@ -1,0 +1,19 @@
+Woodstox 6.5.1 (com.fasterxml.woodstox:woodstox-core), compiled into libdssnative: the StAX parser DSS reads
+XML with. https://github.com/FasterXML/woodstox
+
+Copyright (c) 2004- Tatu Saloranta, tatu.saloranta@iki.fi (the copyright line of Woodstox's source files)
+
+Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance
+with the License. You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+A copy of the License is also in the LICENSE file of the other Apache-2.0 components in licenses/java/ (for
+example httpclient5-*/LICENSE).
+
+Unless required by applicable law or agreed to in writing, software distributed under the License is
+distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See
+the License for the specific language governing permissions and limitations under the License.
+
+The jar's own META-INF/LICENSE, kept next to this file as LICENSE, names "Jackson JSON processor databind module":
+it is FasterXML's generic Apache-2.0 notice, copied into Woodstox by mistake. Woodstox has no NOTICE file.

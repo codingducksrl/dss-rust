@@ -1,0 +1,133 @@
+# SPDX-FileCopyrightText: 2026 Coding Duck
+# SPDX-License-Identifier: LGPL-2.1-or-later
+#
+# The cheap checks, on every push to main and every pull request: one Linux job of a few minutes, without the
+# native-image builds that make ci.yml expensive (docs/DECISIONS.md, "Release gates"). Clippy and the Rust tests
+# need the native library, so they stay in ci.yml.
+#
+# Runs on main also keep the setup action's caches (GraalVM download, Maven, Cargo) on the default branch, where
+# tag builds can restore them: caches saved by a tag run are visible to that tag only. The checks job saves the
+# linux-x64 ones; warm-caches saves those of the other release platforms (linux-aarch64, macos-aarch64), which
+# need their own runners. The twice-weekly schedule keeps them from GitHub's 7-day eviction of unused caches when
+# main sees no push; a run that only restores exact hits takes about two minutes per platform.
+name: Checks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "23 4 * * 1,4"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: checks-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: ./.github/actions/setup
+        with:
+          platform: linux-x64
+
+      # Nothing from testdata/private/ in the index, an SPDX header or REUSE.toml annotation on every file, the text
+      # of exactly the licences in use in LICENSES/, and the same GraalVM CE release in scripts/ci/install-graalvm.sh
+      # and java/pom.xml.
+      - name: Repository rules
+        run: python3 scripts/ci/check-repo.py
+
+      # The REUSE specification as its reference tool reads it (LICENSING.md): licence texts in LICENSES/, every
+      # header and REUSE.toml annotation parsable. Pinned; charset-normalizer detects file encodings without
+      # libmagic.
+      - name: REUSE compliance
+        run: pipx run --spec 'reuse[charset-normalizer]==6.3.0' reuse lint
+
+      - name: Script tests (scripts/ci/test-scripts.sh)
+        run: scripts/ci/test-scripts.sh
+
+      - name: Shell, Python and PHP syntax
+        run: |
+          for f in scripts/*.sh scripts/ci/*.sh; do bash -n "$f"; done
+          shellcheck --severity=error scripts/*.sh scripts/ci/*.sh
+          python3 -m py_compile scripts/*.py scripts/ci/*.py
+          find php -name '*.php' -not -path '*/vendor/*' -print0 | xargs -0 -r -n1 php -l
+
+      - name: Rust format
+        working-directory: rust
+        run: cargo fmt --all --check
+
+      - name: JVM tests
+        working-directory: java
+        run: ./mvnw -B test
+
+  # The Laravel client (php/): its lint and PHPUnit suite, without the native library and without network beyond
+  # Packagist, with the newest dependencies composer.json allows on each PHP: 8.1 (the lowest it accepts) resolves
+  # to Laravel 10, 8.2 and 8.4 to the newest Laravel. The checks job only runs `php -l` on the client.
+  php-client:
+    name: PHP ${{ matrix.php }}
+    strategy:
+      fail-fast: false
+      matrix:
+        php: ["8.1", "8.2", "8.4"]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: shivammathur/setup-php@eb7c497e18156a6bbabfef1d3a82760b9eda3962 # 2.40.0
+        with:
+          php-version: ${{ matrix.php }}
+          extensions: mbstring
+          tools: composer
+          coverage: none
+
+      # No composer.lock is committed (php/.gitignore): each PHP resolves its own newest set.
+      - name: Lint and tests
+        working-directory: php
+        run: |
+          composer install --no-interaction --no-progress
+          composer lint
+          composer test
+
+  # The setup action plus a download of every Maven and Cargo dependency the release build needs, for the
+  # platforms the checks job does not run on; actions/cache saves them at the end of the job.
+  warm-caches:
+    name: caches for ${{ matrix.platform }}
+    if: github.event_name != 'pull_request'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { platform: linux-aarch64, runner: ubuntu-24.04-arm }
+          - { platform: macos-aarch64, runner: macos-15 }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: ./.github/actions/setup
+        with:
+          platform: ${{ matrix.platform }}
+
+      # -Pnative: the native-image, licence and SBOM plugins of scripts/build-native.sh. test-compile also fetches
+      # what go-offline misses (the compiler's own dependencies); surefire's providers come with the first test run.
+      - name: Maven dependencies
+        working-directory: java
+        run: ./mvnw -B -q -Pnative dependency:go-offline test-compile
+
+      - name: Cargo dependencies
+        working-directory: rust
+        run: cargo fetch --locked

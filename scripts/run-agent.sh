@@ -5,8 +5,8 @@
 # Runs the JVM test suite under the GraalVM tracing agent (native-image-agent) and writes raw reachability
 # metadata to java/target/agent-output/:
 #
-#   main/   calls made by library code: DSS, its dependencies, our engine. JUnit, Surefire and our test
-#           support code are excluded as callers (scripts/agent/caller-filter.json).
+#   main/   calls made by library code: DSS and its dependencies. JUnit, Maven/Surefire and all of our own code
+#           (engine and test support) are excluded as callers (scripts/agent/caller-filter.json).
 #   full/   everything, including what only the tests need.
 #   online/ with --online: the real-LOTL suite (needs internet), library calls only. Catches what only real
 #           networks exercise (servers, TLS, redirects); merged into the library metadata.

@@ -18,9 +18,9 @@ use std::time::{Duration, Instant};
 use base64::Engine as _;
 use common::*;
 use dss::{
-    Config, DetachedContent, Engine, EngineBuilder, ErrorCode, ExtendOptions, Http, ImagePosition, Indication, Level,
-    Options, PadesOptions, Placement, PreparedSignature, RefreshRecord, Report, SignOptions, SignatureFormat,
-    SigningMode, TrustedListStatus, Tsa, VisibleSignature,
+    CancelToken, Config, DetachedBytes, DetachedContent, Engine, EngineBuilder, ErrorCode, ExtendOptions, Http,
+    ImagePosition, Indication, Level, Options, PadesOptions, Placement, PreparedSignature, RefreshRecord, Report,
+    SignOptions, SignatureFormat, SigningMode, TrustedListStatus, Tsa, VisibleSignature,
 };
 
 #[test]
@@ -28,6 +28,98 @@ fn version() {
     let v = offline_engine(1).version().unwrap();
     assert_eq!(v.dss, "6.5.1");
     assert!(v.runtime.contains("Substrate VM"), "{}", v.runtime);
+    assert_eq!(
+        v.api_version,
+        Some(dss::API_VERSION),
+        "the library states its API version"
+    );
+    // The same without an engine, before and after one exists (its probe isolate must not be the only one).
+    let standalone = dss::library_version().unwrap();
+    assert_eq!((&standalone.library, &standalone.dss), (&v.library, &v.dss));
+    assert_eq!(standalone.api_version, v.api_version);
+    let again = dss::library_version().unwrap();
+    assert_eq!(again.library, v.library);
+    assert!(offline_engine(1).version().is_ok(), "an engine still starts after it");
+}
+
+/// A queued call whose token is cancelled before a worker takes it is skipped with `Error::Cancelled`. The only
+/// worker is held meanwhile by an extension waiting on a TSA that never answers (the response timeout, 2 s).
+#[test]
+fn cancelled_calls_are_skipped_while_queued() {
+    let (port, stop, server) = never_answering_server();
+    let mut config = offline_config();
+    config.tsa = Some(Tsa::new(format!("http://127.0.0.1:{port}/tsr")));
+    config.http = Some(Http {
+        connect_timeout_ms: Some(1000),
+        response_timeout_ms: Some(2000),
+        block_private_addresses: Some(false), // the test servers are on 127.0.0.1
+        ..Default::default()
+    });
+    let cache = temp_dir("cache");
+    let engine = Arc::new(EngineBuilder::new(&cache, &config).build().unwrap()); // one worker
+    let doc = Arc::new(read_fixture("pades/b-lt.pdf"));
+
+    let blocker = {
+        let (engine, doc) = (Arc::clone(&engine), Arc::clone(&doc));
+        thread::spawn(move || {
+            let started = Instant::now();
+            (engine.extend(&doc, &ExtendOptions::new(Level::Lta)), started.elapsed())
+        })
+    };
+    thread::sleep(Duration::from_millis(250)); // the worker is now waiting on the TSA
+    let token = CancelToken::new();
+    let queued = {
+        let (engine, doc, token) = (Arc::clone(&engine), Arc::clone(&doc), token.clone());
+        thread::spawn(move || {
+            let started = Instant::now();
+            let result = engine.cancellable(&token).validate(&doc, &Options::default());
+            (result, started.elapsed())
+        })
+    };
+    thread::sleep(Duration::from_millis(250));
+    token.cancel();
+    let (result, waited) = queued.join().unwrap();
+    assert!(matches!(result, Err(dss::Error::Cancelled)), "{result:?}");
+    let (blocked, took) = blocker.join().unwrap();
+    assert!(
+        took >= Duration::from_secs(1),
+        "the extension did not block on the TSA ({took:?})"
+    );
+    assert!(blocked.is_err(), "no TSA answered");
+    assert!(
+        waited >= Duration::from_millis(500),
+        "the queued call was answered by the worker, after the blocked call ({waited:?})"
+    );
+
+    // A token that is not cancelled changes nothing; one cancelled beforehand skips the call at once.
+    let fresh = CancelToken::new();
+    let reports = engine.cancellable(&fresh).validate(&doc, &Options::default()).unwrap();
+    assert!(reports.all_passed());
+    let cancelled = CancelToken::new();
+    cancelled.cancel();
+    let started = Instant::now();
+    for result in [
+        engine.cancellable(&cancelled).validate_json(&doc, "{}").map(drop),
+        engine
+            .cancellable(&cancelled)
+            .extend(&doc, &ExtendOptions::new(Level::Lt))
+            .map(drop),
+        engine
+            .cancellable(&cancelled)
+            .prepare_signature(&doc, &SignOptions::new(SigningMode::Cms, Level::B))
+            .map(drop),
+        engine
+            .cancellable(&cancelled)
+            .complete_signature_json(&doc, "{}", b"x")
+            .map(drop),
+    ] {
+        assert!(matches!(result, Err(dss::Error::Cancelled)), "{result:?}");
+    }
+    assert!(started.elapsed() < Duration::from_secs(1), "skipped without running");
+    assert!(engine.validate(&doc, &Options::default()).unwrap().all_passed());
+
+    stop.store(true, Ordering::Relaxed);
+    server.join().unwrap();
 }
 
 #[test]
@@ -116,6 +208,117 @@ fn detached_content_and_reports() {
     );
 }
 
+/// The signed content as bytes: `validate_with_contents` (binary through `dss_validate_with_contents`), and
+/// `DetachedContent::bytes` inside the options, which takes the same route. Both match the file route's verdicts.
+#[test]
+fn detached_content_as_bytes() {
+    let engine = offline_engine(1);
+    let p7s = read_fixture("cades/detached.txt.p7s");
+    let content = read_fixture("content/document.txt");
+    let tampered = read_fixture("tampered/content/document.txt");
+    let sub = |r: &dss::Reports| r.signatures[0].sub_indication.clone();
+
+    let ok = engine
+        .validate_with_contents(
+            &p7s,
+            &Options::default(),
+            &[DetachedBytes::named("document.txt", &content)],
+        )
+        .unwrap();
+    assert_ne!(sub(&ok).as_deref(), Some("HASH_FAILURE"), "{ok:?}");
+    let unnamed = engine
+        .validate_with_contents(&p7s, &Options::default(), &[DetachedBytes::unnamed(&content)])
+        .unwrap();
+    assert_eq!(sub(&unnamed), sub(&ok));
+    let bad = engine
+        .validate_with_contents(
+            &p7s,
+            &Options::default(),
+            &[DetachedBytes::named("document.txt", &tampered)],
+        )
+        .unwrap();
+    assert_eq!(sub(&bad).as_deref(), Some("HASH_FAILURE"));
+
+    // The options' own entries are kept next to the binary ones: a CAdES signature with two candidate contents
+    // is SIGNED_DATA_NOT_FOUND (DSS uses the detached content of a CMS only when there is exactly one).
+    let both = engine
+        .validate_with_contents(
+            &p7s,
+            &Options {
+                detached_contents: vec![DetachedContent::file(fixture("content/document.txt"))],
+                ..Default::default()
+            },
+            &[DetachedBytes::named("document.txt", &content)],
+        )
+        .unwrap();
+    assert_eq!(sub(&both).as_deref(), Some("SIGNED_DATA_NOT_FOUND"), "{both:?}");
+
+    // DetachedContent::bytes in the options goes the same way (no base64 in the JSON).
+    let typed = engine
+        .validate(
+            &p7s,
+            &Options {
+                detached_contents: vec![DetachedContent::bytes("document.txt", content.clone())],
+                reports: Some(vec![Report::Detailed]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(sub(&typed), sub(&ok));
+    assert!(
+        typed.detailed_report_xml.is_some(),
+        "the JSON part of the options still applies"
+    );
+
+    // The JSON route, with the JSON's own `detached_contents` merged in (two contents again), and typed errors.
+    let json = engine
+        .validate_with_contents_json(
+            &p7s,
+            r#"{"detached_contents":[{"name":"json.txt","base64":"bm90IHRoZSBjb250ZW50"}],"reports":["simple"]}"#,
+            &[DetachedBytes::named("document.txt", &content)],
+        )
+        .unwrap();
+    assert!(
+        json.contains("\"ok\":true") && json.contains("SIGNED_DATA_NOT_FOUND"),
+        "{json}"
+    );
+    let json = engine
+        .validate_with_contents_json(&p7s, r#"{"reports":["simple"]}"#, &[DetachedBytes::unnamed(&content)])
+        .unwrap();
+    assert!(
+        json.contains("\"ok\":true") && !json.contains("SIGNED_DATA_NOT_FOUND"),
+        "{json}"
+    );
+    let err = engine
+        .validate_with_contents_json(&p7s, "{not json", &[DetachedBytes::unnamed(&content)])
+        .unwrap_err();
+    assert_eq!(err.code(), Some(ErrorCode::InvalidArgument), "{err}");
+
+    let err = engine
+        .validate_with_contents(&p7s, &Options::default(), &[DetachedBytes::named("empty.txt", b"")])
+        .unwrap_err();
+    assert_eq!(err.code(), Some(ErrorCode::InvalidArgument), "{err}");
+    assert!(err.to_string().contains("contents[0] is empty"), "{err}");
+    let too_many: Vec<DetachedBytes<'_>> = (0..1025).map(|_| DetachedBytes::unnamed(b"x")).collect();
+    let err = engine
+        .validate_with_contents(&p7s, &Options::default(), &too_many)
+        .unwrap_err();
+    assert_eq!(err.code(), Some(ErrorCode::InvalidArgument), "{err}");
+    assert!(err.to_string().contains("count larger than 1024"), "{err}");
+    let err = engine
+        .validate_with_contents(&p7s, &Options::default(), &[DetachedBytes::named("a\0b", &content)])
+        .unwrap_err();
+    assert!(matches!(err, dss::Error::Nul), "{err}");
+
+    // Cancellable, like validate.
+    let token = CancelToken::new();
+    let cancellable = engine
+        .cancellable(&token)
+        .validate_with_contents(&p7s, &Options::default(), &[DetachedBytes::unnamed(&content)])
+        .unwrap();
+    assert_eq!(sub(&cancellable), sub(&ok));
+}
+
 #[test]
 fn errors_are_typed() {
     let engine = offline_engine(1);
@@ -137,10 +340,10 @@ fn errors_are_typed() {
 
     let mut config = offline_config();
     config.countries = vec!["Italy".into()];
-    let err = EngineBuilder::new(temp_dir("cache"), &config).build().unwrap_err();
+    let err = EngineBuilder::new(&temp_dir("cache"), &config).build().unwrap_err();
     assert_eq!(err.code(), Some(ErrorCode::InvalidConfig), "{err}");
 
-    let err = Engine::builder(temp_dir("cache"), &Config::new("/nonexistent.p12"))
+    let err = Engine::builder(&temp_dir("cache"), &Config::new("/nonexistent.p12"))
         .build()
         .unwrap_err();
     assert_eq!(err.code(), Some(ErrorCode::InvalidConfig), "{err}");
@@ -442,7 +645,7 @@ fn extensions_and_validations_from_many_threads() {
 fn tsa_config_is_checked() {
     let mut config = offline_config();
     config.tsa = Some(Tsa::new("https://tsa.example.test/tsr"));
-    assert!(EngineBuilder::new(temp_dir("cache"), &config).build().is_ok());
+    assert!(EngineBuilder::new(&temp_dir("cache"), &config).build().is_ok());
     for tsa in [
         Tsa::new("ftp://tsa.example.test"),
         Tsa {
@@ -451,7 +654,7 @@ fn tsa_config_is_checked() {
         },
     ] {
         config.tsa = Some(tsa);
-        let err = EngineBuilder::new(temp_dir("cache"), &config).build().unwrap_err();
+        let err = EngineBuilder::new(&temp_dir("cache"), &config).build().unwrap_err();
         assert_eq!(err.code(), Some(ErrorCode::InvalidConfig), "{err}");
     }
 }
@@ -463,15 +666,16 @@ fn tl_snapshot_errors_are_typed() {
     let err = engine.export_tl_snapshot().unwrap_err();
     assert_eq!(err.code(), Some(ErrorCode::TrustedListsNotLoaded), "{err}");
 
+    let snapshots = temp_dir("snapshot");
     let mut config = offline_config();
-    config.tl_snapshot = Some(temp_dir("snapshot").join("missing.tlsnap"));
-    let err = EngineBuilder::new(temp_dir("cache"), &config).build().unwrap_err();
+    config.tl_snapshot = Some(snapshots.join("missing.tlsnap"));
+    let err = EngineBuilder::new(&temp_dir("cache"), &config).build().unwrap_err();
     assert_eq!(err.code(), Some(ErrorCode::TlSnapshotRejected), "{err}");
 
-    let not_a_snapshot = temp_dir("snapshot").join("other.tlsnap");
+    let not_a_snapshot = snapshots.join("other.tlsnap");
     std::fs::write(&not_a_snapshot, b"%PDF-1.7 hello").unwrap();
     config.tl_snapshot = Some(not_a_snapshot);
-    let err = EngineBuilder::new(temp_dir("cache"), &config).build().unwrap_err();
+    let err = EngineBuilder::new(&temp_dir("cache"), &config).build().unwrap_err();
     assert_eq!(err.code(), Some(ErrorCode::TlSnapshotRejected), "{err}");
     assert!(err.to_string().contains("not a trusted-list snapshot"), "{err}");
 }
@@ -480,11 +684,40 @@ fn tl_snapshot_errors_are_typed() {
 fn empty_cache_refuses_to_validate() {
     let mut config = offline_config();
     config.require_trusted_lists = None; // the default: true
-    let engine = EngineBuilder::new(temp_dir("cache"), &config).build().unwrap();
+    let cache = temp_dir("cache");
+    let engine = EngineBuilder::new(&cache, &config).build().unwrap();
     assert!(!engine.init_info().trusted_lists_loaded);
     let status = engine.trusted_list_status().unwrap();
     assert!(!status.loaded);
     assert_eq!(status.trusted_certificates, 0);
+    // The OJ keystore in use is reported by dss_init and by the status, before any refresh.
+    let keystore = status.oj_keystore.as_ref().expect("oj_keystore in the status");
+    assert!(keystore.path.ends_with("oj-keystore.p12"), "{}", keystore.path);
+    assert!(
+        keystore.sha256.len() == 64
+            && keystore
+                .sha256
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+        "{}",
+        keystore.sha256
+    );
+    assert_eq!(
+        engine
+            .init_info()
+            .oj_keystore
+            .as_ref()
+            .expect("oj_keystore in dss_init"),
+        keystore
+    );
+    assert_eq!(engine.init_info().log_level.as_deref(), Some("error"));
+    for list in status.lotls.iter().chain(&status.tls) {
+        assert_eq!(
+            list.last_published_sequence_number, None,
+            "nothing published from {}",
+            list.url
+        );
+    }
     let err = engine
         .validate(&read_fixture("pades/b-lta.pdf"), &Options::default())
         .unwrap_err();
@@ -520,7 +753,8 @@ fn concurrent_validations_from_many_threads() {
 /// A document that does not fit the isolate's heap is an error result; the engine stays usable.
 #[test]
 fn heap_limit_is_an_error_not_a_crash() {
-    let engine = EngineBuilder::new(temp_dir("cache"), &offline_config())
+    let cache = temp_dir("cache");
+    let engine = EngineBuilder::new(&cache, &offline_config())
         .max_heap("64m")
         .build()
         .unwrap();
@@ -536,11 +770,123 @@ fn heap_limit_is_an_error_not_a_crash() {
 
 #[test]
 fn invalid_isolate_option_fails_cleanly() {
-    let err = EngineBuilder::new(temp_dir("cache"), &offline_config())
+    let err = EngineBuilder::new(&temp_dir("cache"), &offline_config())
         .isolate_arg("-Xmx-nonsense")
         .build()
         .unwrap_err();
     assert!(matches!(err, dss::Error::Isolate(_)), "{err}");
+
+    // Options the isolate would silently ignore, and heap sizes it would read as bytes, never reach it.
+    let err = EngineBuilder::new(&temp_dir("cache"), &offline_config())
+        .max_heap("512")
+        .build()
+        .unwrap_err();
+    assert!(matches!(err, dss::Error::Argument(_)), "{err}");
+    assert!(err.to_string().contains("max_heap"), "{err}");
+    let err = EngineBuilder::new(&temp_dir("cache"), &offline_config())
+        .isolate_arg("-xmx512m")
+        .build()
+        .unwrap_err();
+    assert!(matches!(err, dss::Error::Argument(_)), "{err}");
+}
+
+/// Dropping the last handle while callers still have work in flight: every call completes, and the drop (which
+/// runs on whichever caller finishes last) joins the workers and tears the isolate down without hanging.
+#[test]
+fn drop_with_calls_in_flight_completes_them() {
+    let engine = Arc::new(offline_engine(2));
+    let doc = Arc::new(read_fixture("pades/b-lta.pdf"));
+    let callers: Vec<_> = (0..8)
+        .map(|_| {
+            let (engine, doc) = (Arc::clone(&engine), Arc::clone(&doc));
+            thread::spawn(move || engine.validate(&doc, &Options::default()))
+        })
+        .collect();
+    drop(engine);
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let results: Vec<_> = callers.into_iter().map(|c| c.join().unwrap()).collect();
+        let _ = done_tx.send(results);
+    });
+    let results = done_rx
+        .recv_timeout(Duration::from_secs(60))
+        .expect("the callers (and the engine drop) finished");
+    assert_eq!(results.len(), 8);
+    for r in results {
+        assert!(r.unwrap().all_passed());
+    }
+}
+
+/// The main handle goes while an online refresh is blocked on a server that never answers; the refresher's
+/// handle, the last one, drops the engine the moment the refresh returns. Drop then joins the refresh thread
+/// before dss_shutdown (so it never races dss_tl_refresh_online) and finishes promptly.
+#[test]
+fn drop_during_a_blocked_refresh_waits_for_it() {
+    let (port, stop, server) = never_answering_server();
+    let mut config = offline_config();
+    config.lotl_url = Some(format!("http://127.0.0.1:{port}/eu-lotl.xml"));
+    config.http = Some(Http {
+        connect_timeout_ms: Some(1000),
+        response_timeout_ms: Some(2000),
+        block_private_addresses: Some(false), // the test servers are on 127.0.0.1
+        ..Default::default()
+    });
+    let cache = temp_dir("cache");
+    let engine = Arc::new(EngineBuilder::new(&cache, &config).build().unwrap());
+    let refresher = {
+        let engine = Arc::clone(&engine);
+        thread::spawn(move || {
+            let result = engine.refresh_trusted_lists();
+            let started = Instant::now();
+            drop(engine); // the last handle: Engine::drop runs here
+            (result, started.elapsed())
+        })
+    };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !engine.trusted_list_status().unwrap().refresh_in_progress {
+        assert!(Instant::now() < deadline, "refresh never started");
+        thread::sleep(Duration::from_millis(20));
+    }
+    let dropped_at = Instant::now();
+    drop(engine);
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let _ = done_tx.send(refresher.join().unwrap());
+    });
+    let (result, drop_took) = done_rx
+        .recv_timeout(Duration::from_secs(60))
+        .expect("the refresh returned and the engine dropped");
+    assert!(
+        dropped_at.elapsed() >= Duration::from_millis(500),
+        "the refresh was still running when the last handle went"
+    );
+    let _ = result; // Ok (nothing downloadable) or TL_REFRESH_FAILED, depending on the library: not the point.
+    assert!(drop_took < Duration::from_secs(30), "drop took {drop_took:?}");
+
+    stop.store(true, Ordering::Relaxed);
+    server.join().unwrap();
+}
+
+/// A TCP server on 127.0.0.1 that accepts connections and never answers: (port, stop flag, thread).
+fn never_answering_server() -> (u16, Arc<AtomicBool>, thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop2 = Arc::clone(&stop);
+    let server = thread::spawn(move || {
+        listener.set_nonblocking(true).unwrap();
+        let mut held = vec![];
+        while !stop2.load(Ordering::Relaxed) {
+            if let Ok((mut s, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = s.set_nonblocking(true);
+                let _ = s.read(&mut buf);
+                held.push(s); // never respond
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    });
+    (port, stop, server)
 }
 
 #[test]
@@ -582,14 +928,11 @@ fn validation_keeps_working_during_a_refresh() {
     config.http = Some(Http {
         connect_timeout_ms: Some(1000),
         response_timeout_ms: Some(2500),
+        block_private_addresses: Some(false), // the test servers are on 127.0.0.1
         ..Default::default()
     });
-    let engine = Arc::new(
-        EngineBuilder::new(temp_dir("cache"), &config)
-            .workers(2)
-            .build()
-            .unwrap(),
-    );
+    let cache = temp_dir("cache");
+    let engine = Arc::new(EngineBuilder::new(&cache, &config).workers(2).build().unwrap());
 
     let refresher = {
         let engine = Arc::clone(&engine);
@@ -668,8 +1011,14 @@ fn synthetic_tl_snapshot_round_trip() {
     assert_eq!(snapshot.info.size, snapshot.bytes.len() as u64);
     assert_eq!(snapshot.info.trusted_certificates, 3);
     assert_eq!(snapshot.info.lists_loaded.as_ref().unwrap().mode, "offline");
-    assert!(snapshot.info.settings["oj_keystore_sha256"].is_string());
-    let file = temp_dir("snapshot").join("lists.tlsnap");
+    // The snapshot records the digest of the keystore the engine runs with.
+    let status = source.trusted_list_status().unwrap();
+    assert_eq!(
+        snapshot.info.settings["oj_keystore_sha256"].as_str(),
+        Some(status.oj_keystore.expect("oj_keystore").sha256.as_str())
+    );
+    let snapshots = temp_dir("snapshot");
+    let file = snapshots.join("lists.tlsnap");
     std::fs::write(&file, &snapshot.bytes).unwrap();
 
     let mut with_snapshot: serde_json::Value = serde_json::from_str(&config).unwrap();
@@ -719,7 +1068,7 @@ fn synthetic_tl_snapshot_round_trip() {
 
     // The same file under other trusted-list settings is refused.
     with_snapshot["countries"] = serde_json::json!(["IT"]);
-    let err = EngineBuilder::with_config_json(temp_dir("cache"), with_snapshot.to_string())
+    let err = EngineBuilder::with_config_json(&temp_dir("cache"), with_snapshot.to_string())
         .build()
         .unwrap_err();
     assert_eq!(err.code(), Some(ErrorCode::TlSnapshotRejected), "{err}");
@@ -759,12 +1108,8 @@ fn online_refresh_while_validating() {
     let mut config = offline_config();
     config.require_trusted_lists = None;
     config.countries = vec!["IT".into()];
-    let engine = Arc::new(
-        EngineBuilder::new(temp_dir("online"), &config)
-            .workers(2)
-            .build()
-            .unwrap(),
-    );
+    let cache = temp_dir("online");
+    let engine = Arc::new(EngineBuilder::new(&cache, &config).workers(2).build().unwrap());
     let (first, _) = refresh_until_downloaded(&engine);
     assert!(first.completed && first.trusted_certificates > 0, "{first:?}");
 

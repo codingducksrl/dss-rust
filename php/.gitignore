@@ -1,0 +1,5 @@
+# composer install for the client's tests (composer test)
+/vendor/
+/composer.lock
+/.phpunit.cache/
+/.phpunit.result.cache

@@ -19,13 +19,16 @@ class OutcomeTest {
             "PAdES-BASELINE-LTA", "QESIG", "2026-01-01T00:00:00Z", "CN=A,C=IT");
 
     private static Outcome with(Outcome.SignatureRecord s) {
-        return new Outcome(null, List.of(s), List.of());
+        return new Outcome(List.of(s), List.of());
     }
 
     @Test
     void equalOutcomesHaveNoDifferences() {
         assertTrue(Outcome.compare(with(SIG), with(SIG)).isEmpty());
-        assertTrue(Outcome.compare(Outcome.rejected("x"), Outcome.rejected("y")).isEmpty());
+        assertTrue(Outcome.compare(Outcome.rejected("VALIDATION_FAILED", "x"),
+                Outcome.rejected("VALIDATION_FAILED", "y")).isEmpty());
+        assertTrue(Outcome.compare(Outcome.rejected(null, "x"), Outcome.rejected("UNSUPPORTED_DOCUMENT", "y")).isEmpty(),
+                "an unknown code is not a difference");
     }
 
     @Test
@@ -44,12 +47,19 @@ class OutcomeTest {
     }
 
     @Test
+    void theReasonForARejectionIsCompared() {
+        List<String> diff = Outcome.compare(Outcome.rejected("UNSUPPORTED_DOCUMENT", "not a PDF or CMS"),
+                Outcome.rejected("VALIDATION_FAILED", "cannot parse document"));
+        assertEquals(List.of("error code: plain DSS=UNSUPPORTED_DOCUMENT, other=VALIDATION_FAILED"), diff);
+    }
+
+    @Test
     void structureDifferencesAreDetected() {
-        assertEquals(1, Outcome.compare(with(SIG), Outcome.rejected("x")).size());
-        assertTrue(!Outcome.compare(with(SIG), new Outcome(null, List.of(), List.of())).isEmpty(), "missing signature");
-        Outcome nested = new Outcome(null, List.of(SIG), List.of(with(SIG)));
+        assertEquals(1, Outcome.compare(with(SIG), Outcome.rejected(null, "x")).size());
+        assertTrue(!Outcome.compare(with(SIG), new Outcome(List.of(), List.of())).isEmpty(), "missing signature");
+        Outcome nested = new Outcome(List.of(SIG), List.of(with(SIG)));
         assertEquals(1, Outcome.compare(nested, with(SIG)).size());
-        Outcome nestedDifferent = new Outcome(null, List.of(SIG), List.of(Outcome.rejected("x")));
+        Outcome nestedDifferent = new Outcome(List.of(SIG), List.of(Outcome.rejected(null, "x")));
         assertEquals(1, Outcome.compare(nested, nestedDifferent).size());
     }
 }

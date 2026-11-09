@@ -15,16 +15,24 @@ import it.codingduck.dssnative.engine.ValidationResult;
 /**
  * What the differential test compares for one document: per signature the fields named in the brief
  * (indication, sub-indication, level, qualification, signing time, signer DN), at every nesting level, or the
- * fact that the document was rejected.
+ * fact that the document was rejected and with which error code ({@code errorCode}: the engine's
+ * {@code DssError.Code} name, e.g. UNSUPPORTED_DOCUMENT or VALIDATION_FAILED; null when unknown). The messages of
+ * two rejections legitimately differ and are not compared.
  */
-public record Outcome(String error, List<SignatureRecord> signatures, List<Outcome> nested) {
+public record Outcome(String errorCode, String error, List<SignatureRecord> signatures, List<Outcome> nested) {
 
     public record SignatureRecord(String id, String indication, String subIndication, String format,
                                   String qualification, String signingTime, String signerDn) {
     }
 
-    public static Outcome rejected(String error) {
-        return new Outcome(error, List.of(), List.of());
+    /** An accepted document. */
+    public Outcome(List<SignatureRecord> signatures, List<Outcome> nested) {
+        this(null, null, signatures, nested);
+    }
+
+    /** A rejected document: {@code code} as the engine names it (null when unknown), and a message. */
+    public static Outcome rejected(String code, String message) {
+        return new Outcome(code, message == null ? String.valueOf(code) : message, List.of(), List.of());
     }
 
     static String iso(Date d) {
@@ -43,7 +51,7 @@ public record Outcome(String error, List<SignatureRecord> signatures, List<Outco
         }
         List<Outcome> nested = new ArrayList<>();
         r.nested.forEach(n -> nested.add(of(n)));
-        return new Outcome(null, sigs, nested);
+        return new Outcome(sigs, nested);
     }
 
     /** From the native library's result JSON (as printed by {@code dss-cli validate-batch}). */
@@ -60,7 +68,7 @@ public record Outcome(String error, List<SignatureRecord> signatures, List<Outco
         for (Object n : (List<Object>) result.getOrDefault("nested", List.of())) {
             nested.add(ofJson((Map<String, Object>) n));
         }
-        return new Outcome(null, sigs, nested);
+        return new Outcome(sigs, nested);
     }
 
     /** Differences between {@code expected} (plain DSS) and {@code actual}, as readable lines; empty if equal. */
@@ -77,7 +85,11 @@ public record Outcome(String error, List<SignatureRecord> signatures, List<Outco
             return;
         }
         if (e.error != null) {
-            return; // both rejected the document; the messages legitimately differ
+            // Both rejected the document. The messages legitimately differ; the reason (code) must not.
+            if (e.errorCode != null && a.errorCode != null && !e.errorCode.equals(a.errorCode)) {
+                out.add(path + "error code: plain DSS=" + e.errorCode + ", other=" + a.errorCode);
+            }
+            return;
         }
         if (e.signatures.size() != a.signatures.size()) {
             out.add(path + "signature count: plain DSS=" + e.signatures.size() + ", other=" + a.signatures.size());

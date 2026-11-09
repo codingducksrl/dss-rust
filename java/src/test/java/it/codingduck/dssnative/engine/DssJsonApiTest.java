@@ -6,10 +6,13 @@
 package it.codingduck.dssnative.engine;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.util.Base64;
@@ -20,6 +23,8 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import it.codingduck.dssnative.testsupport.ExternalSigner;
 import it.codingduck.dssnative.testsupport.Fixtures;
@@ -154,6 +159,33 @@ class DssJsonApiTest {
         }
     }
 
+    /**
+     * BouncyCastle, PDFBox and DSS throw IllegalArgument/IllegalState/NullPointer exceptions on damaged input,
+     * which must surface as VALIDATION_FAILED (the document's fault), never as INTERNAL_ERROR (ours).
+     */
+    @Test
+    void damagedCertificatesInACmsAreAValidationFailure() throws Exception {
+        ok(DssJsonApi.init(seededCache().toString(), offlineConfig()));
+        org.bouncycastle.asn1.cms.ContentInfo ci = org.bouncycastle.asn1.cms.ContentInfo.getInstance(
+                Fixtures.read("cades/attached-der.p7m"));
+        org.bouncycastle.asn1.cms.SignedData sd = org.bouncycastle.asn1.cms.SignedData.getInstance(ci.getContent());
+        org.bouncycastle.asn1.ASN1EncodableVector certs = new org.bouncycastle.asn1.ASN1EncodableVector();
+        for (org.bouncycastle.asn1.ASN1Encodable c : sd.getCertificates()) {
+            certs.add(c);
+        }
+        certs.add(new org.bouncycastle.asn1.DERSequence(new org.bouncycastle.asn1.ASN1Integer(1))); // not a Certificate
+        org.bouncycastle.asn1.cms.SignedData damaged = new org.bouncycastle.asn1.cms.SignedData(sd.getDigestAlgorithms(),
+                sd.getEncapContentInfo(), new org.bouncycastle.asn1.DERSet(certs), sd.getCRLs(), sd.getSignerInfos());
+        byte[] cms = new org.bouncycastle.asn1.cms.ContentInfo(ci.getContentType(), damaged)
+                .getEncoded(org.bouncycastle.asn1.ASN1Encoding.DER);
+        Map<String, Object> r = parse(DssJsonApi.validate(cms, null));
+        assertEquals(Boolean.FALSE, r.get("ok"), r.toString());
+        @SuppressWarnings("unchecked")
+        Map<String, Object> err = (Map<String, Object>) r.get("error");
+        assertEquals("VALIDATION_FAILED", err.get("code"), err.toString());
+        assertTrue(((String) err.get("message")).contains("IllegalArgumentException"), err.toString());
+    }
+
     @Test
     @SuppressWarnings("unchecked")
     void tlSnapshotExportsAndStartsAnEngine() throws Exception {
@@ -193,10 +225,118 @@ class DssJsonApiTest {
 
     @Test
     void reInitReplacesTheEngine() {
-        ok(DssJsonApi.init(tmp.resolve("empty").toString(), offlineConfig()));
+        Map<String, Object> first = ok(DssJsonApi.init(tmp.resolve("empty").toString(), offlineConfig()));
         assertEquals(Boolean.FALSE, ok(DssJsonApi.trustedListStatus()).get("loaded"));
         ok(DssJsonApi.init(seededCache().toString(), offlineConfig()));
         assertEquals(Boolean.TRUE, ok(DssJsonApi.trustedListStatus()).get("loaded"));
+        // slf4j-simple fixes its level when the process first logs: init reports the one in force.
+        String effective = System.getProperty("org.slf4j.simpleLogger.defaultLogLevel");
+        assertEquals(effective, first.get("log_level"));
+        Map<String, Object> debug = ok(DssJsonApi.init(seededCache().toString(),
+                t.configJson("\"revocation\":\"offline\",\"aia\":false,\"log_level\":\"debug\"")));
+        assertEquals(effective, debug.get("log_level"), "a re-init cannot change it, and says so");
+        for (String logger : DssJsonApi.SECRET_BEARING_LOGGERS) {
+            assertEquals("info", System.getProperty("org.slf4j.simpleLogger.log." + logger),
+                    logger + " must never log at debug: it would print the TSA's credentials");
+            // slf4j-simple fixes a logger's level when it is created: one made after init must obey the property.
+            assertFalse(LoggerFactory.getLogger(logger + ".after-init").isDebugEnabled(),
+                    logger + " would print Authorization headers at debug");
+        }
+        // Positive control: a logger of our own follows the level in force, so the pin above is not vacuous.
+        Logger ours = LoggerFactory.getLogger("it.codingduck.dssnative.engine.LogLevelProbe");
+        List<String> levels = List.of("trace", "debug", "info", "warn", "error");
+        int inForce = levels.indexOf(effective.toLowerCase(java.util.Locale.ROOT));
+        assertTrue(inForce >= 0, "slf4j-simple level in force: " + effective);
+        assertEquals(inForce <= levels.indexOf("debug"), ours.isDebugEnabled());
+        assertEquals(inForce <= levels.indexOf("warn"), ours.isWarnEnabled());
+        assertEquals(inForce <= levels.indexOf("error"), ours.isErrorEnabled());
+    }
+
+    @Test
+    void shutdownReportsWhetherTheTrustedListThreadsStopped() {
+        assertEquals(Boolean.TRUE, ok(DssJsonApi.shutdown()).get("trusted_list_threads_stopped"), "nothing to stop");
+        ok(DssJsonApi.init(seededCache().toString(), offlineConfig()));
+        assertEquals(Boolean.TRUE, ok(DssJsonApi.shutdown()).get("trusted_list_threads_stopped"));
+        assertError(DssJsonApi.trustedListStatus(), "NOT_INITIALIZED");
+    }
+
+    @Test
+    void aRefreshThatPublishedNothingIsAnError() {
+        TrustedListManager.RefreshRecord failed = new TrustedListManager.RefreshRecord("online",
+                java.time.Instant.parse("2026-01-01T00:00:00Z"), java.time.Instant.parse("2026-01-01T00:00:03Z"), false,
+                "DSSException: the LOTL could not be downloaded", 12);
+        DssError e = org.junit.jupiter.api.Assertions.assertThrows(DssError.class,
+                () -> DssJsonApi.refreshResult(failed));
+        assertEquals(DssError.Code.TL_REFRESH_FAILED, e.code());
+        assertTrue(e.getMessage().contains("the LOTL could not be downloaded"), e.getMessage());
+        TrustedListManager.RefreshRecord fine = new TrustedListManager.RefreshRecord("online",
+                java.time.Instant.parse("2026-01-01T00:00:00Z"), java.time.Instant.parse("2026-01-01T00:00:03Z"), true,
+                null, 12);
+        @SuppressWarnings("unchecked")
+        Map<String, Object> refresh = (Map<String, Object>) DssJsonApi.refreshResult(fine).get("refresh");
+        assertEquals(Boolean.TRUE, refresh.get("completed"));
+        assertEquals(12, refresh.get("trusted_certificates"));
+    }
+
+    @Test
+    void validationsSurviveReInitAndShutdownUnderway() throws Exception {
+        ok(DssJsonApi.init(seededCache().toString(), offlineConfig()));
+        byte[] pdf = Fixtures.read("pades/b-lta.pdf");
+        List<Thread> workers = new java.util.ArrayList<>();
+        List<String> codes = java.util.Collections.synchronizedList(new java.util.ArrayList<>());
+        java.util.concurrent.CountDownLatch started = new java.util.concurrent.CountDownLatch(4);
+        for (int i = 0; i < 4; i++) {
+            Thread w = new Thread(() -> {
+                started.countDown();
+                for (int n = 0; n < 8; n++) {
+                    Map<String, Object> r = parse(DssJsonApi.validate(pdf, null));
+                    if (Boolean.FALSE.equals(r.get("ok"))) {
+                        @SuppressWarnings("unchecked")
+                        Map<String, Object> err = (Map<String, Object>) r.get("error");
+                        codes.add((String) err.get("code"));
+                    } else {
+                        codes.add("OK");
+                    }
+                }
+            });
+            w.start();
+            workers.add(w);
+        }
+        started.await();
+        for (int i = 0; i < 3; i++) {
+            ok(DssJsonApi.init(seededCache().toString(), offlineConfig()));
+        }
+        ok(DssJsonApi.shutdown());
+        for (Thread w : workers) {
+            w.join(30_000);
+        }
+        assertEquals(32, codes.size());
+        assertTrue(codes.contains("OK"), codes.toString());
+        // Validations that started on an engine replaced meanwhile finish; after shutdown they are refused cleanly.
+        codes.forEach(c -> assertTrue(List.of("OK", "NOT_INITIALIZED").contains(c), codes.toString()));
+    }
+
+    @Test
+    void validationResultCarriesTheAggregateVerdictAndLimitsApply() {
+        ok(DssJsonApi.init(seededCache().toString(), t.configJson("\"revocation\":\"offline\",\"aia\":false,"
+                + "\"limits\":{\"max_pdf_signatures\":1}")));
+        Map<String, Object> unsigned = ok(DssJsonApi.validate(Fixtures.read("content/document.pdf"), null));
+        assertEquals(Boolean.FALSE, unsigned.get("all_passed"));
+        assertEquals(List.of(), unsigned.get("signatures"));
+        assertEquals(List.of(), unsigned.get("timestamps"));
+        Map<String, Object> signed = ok(DssJsonApi.validate(Fixtures.read("pades/b-b.pdf"), null));
+        assertEquals(Boolean.FALSE, signed.get("all_passed"), "INDETERMINATE without revocation data");
+        @SuppressWarnings("unchecked")
+        Map<String, Object> sig = ((List<Map<String, Object>>) signed.get("signatures")).get(0);
+        assertEquals("trusted_list", sig.get("trust_anchor"));
+        assertEquals(Boolean.FALSE, sig.get("modified_after_signing"));
+        assertNotNull(sig.get("changes_after_signing"));
+        assertNotNull(sig.get("qualification_errors"));
+        assertNotNull(sig.get("timestamps"));
+        // Two signature revisions (the signature and a document timestamp) against a limit of one.
+        assertError(DssJsonApi.validate(Fixtures.read("pades/b-lta.pdf"), null), "VALIDATION_FAILED");
+        assertError(DssJsonApi.init(tmp.resolve("c").toString(), t.configJson("\"limits\":{\"max_pdf_pages\":0}")),
+                "INVALID_CONFIG");
     }
 
     @Test
@@ -288,6 +428,95 @@ class DssJsonApiTest {
         assertEquals("6.5.1", v.get("dss"));
         assertNotNull(v.get("library"));
         assertNotNull(v.get("runtime"));
+        // api_version is the integer contract version the Rust/PHP mirrors compare against their own constant
+        assertEquals(1L, v.get("api_version"), "api_version must be a JSON integer, not a string");
+        assertEquals((long) DssJsonApi.API_VERSION, v.get("api_version"));
+        assertTrue(DssJsonApi.version().contains("\"api_version\":1"), DssJsonApi.version());
+    }
+
+    /** The root of trust is known from init, before any refresh, and is what dss_tl_status reports (F-064). */
+    @Test
+    @SuppressWarnings("unchecked")
+    void initReportsTheOjKeystoreInUse() {
+        Map<String, Object> init = ok(DssJsonApi.init(tmp.resolve("empty").toString(), offlineConfig()));
+        Map<String, Object> keystore = (Map<String, Object>) init.get("oj_keystore");
+        assertNotNull(keystore, init.toString());
+        assertEquals(t.ojKeystore.toString(), keystore.get("path"));
+        String sha256 = (String) keystore.get("sha256");
+        assertTrue(sha256.matches("[0-9a-f]{64}"), sha256);
+        assertEquals(keystore, ok(DssJsonApi.trustedListStatus()).get("oj_keystore"));
+    }
+
+    /**
+     * The buffer route behind dss_validate_with_contents (F-188): the signed content decides the verdict, the
+     * buffers are read from position to limit without being moved, and the refusals match the base64 route.
+     */
+    @Test
+    void detachedContentsCanBePassedAsBuffers() {
+        ok(DssJsonApi.init(seededCache().toString(), offlineConfig()));
+        ByteBuffer signature = ByteBuffer.wrap(Fixtures.read("cades/detached.txt.p7s"));
+        byte[] content = Fixtures.read("content/document.txt");
+        byte[] tampered = Fixtures.read("tampered/content/document.txt");
+
+        // No content, as a null or an empty list: exactly the plain validate.
+        assertEquals("SIGNED_DATA_NOT_FOUND",
+                signatureOf(DssJsonApi.validate(signature, null, null)).get("sub_indication"));
+        assertEquals("SIGNED_DATA_NOT_FOUND",
+                signatureOf(DssJsonApi.validate(signature, "{}", List.of())).get("sub_indication"));
+
+        // The content in a direct buffer, as a slice with a position and a limit, which the call leaves alone.
+        ByteBuffer slice = ByteBuffer.allocateDirect(content.length + 8);
+        slice.position(4);
+        slice.put(content);
+        slice.position(4).limit(4 + content.length);
+        Map<String, Object> with = signatureOf(DssJsonApi.validate(signature, "{\"reports\":[\"detailed\"]}",
+                List.of(new DssJsonApi.DetachedContent("document.txt", slice))));
+        assertEquals(4, slice.position());
+        assertEquals(4 + content.length, slice.limit());
+        assertEquals("CAdES-BASELINE-B", with.get("format"));
+        assertNotEquals("SIGNED_DATA_NOT_FOUND", with.get("sub_indication"));
+        assertNotEquals("HASH_FAILURE", with.get("sub_indication"));
+
+        Map<String, Object> bad = signatureOf(DssJsonApi.validate(signature, null,
+                List.of(new DssJsonApi.DetachedContent("document.txt", ByteBuffer.wrap(tampered)))));
+        assertEquals("TOTAL_FAILED", bad.get("indication"));
+        assertEquals("HASH_FAILURE", bad.get("sub_indication"));
+
+        // A binary content next to an entry the caller's JSON already carries (the C smoke test's mixed case).
+        Map<String, Object> mixed = signatureOf(DssJsonApi.validate(signature,
+                "{\"detached_contents\":[{\"name\":\"other\",\"base64\":\"AQID\"}]}",
+                List.of(new DssJsonApi.DetachedContent(null, ByteBuffer.wrap(content)))));
+        assertEquals("CAdES-BASELINE-B", mixed.get("format"));
+
+        // Refusals, with the messages dss_validate_with_contents documents.
+        List<DssJsonApi.DetachedContent> one = List.of(new DssJsonApi.DetachedContent("a", ByteBuffer.wrap(content)));
+        assertEquals("contents[1] is empty", errorMessage(DssJsonApi.validate(signature, null, List.of(
+                new DssJsonApi.DetachedContent("a", ByteBuffer.wrap(content)),
+                new DssJsonApi.DetachedContent(null, ByteBuffer.allocate(0))))));
+        assertEquals("contents[0] is NULL", errorMessage(DssJsonApi.validate(signature, null,
+                java.util.Collections.singletonList(null))));
+        assertTrue(errorMessage(DssJsonApi.validate(signature, "{not json", one))
+                .startsWith("options_json is not valid JSON"));
+        assertEquals("options: 'detached_contents' must be an array of objects",
+                errorMessage(DssJsonApi.validate(signature, "{\"detached_contents\":\"x\"}", one)));
+        assertError(DssJsonApi.validate(signature, "{\"nope\":1}", one), "INVALID_ARGUMENT");
+        assertError(DssJsonApi.validate(null, null, one), "INVALID_ARGUMENT");
+        assertError(DssJsonApi.validate(ByteBuffer.allocate(0), null, one), "INVALID_ARGUMENT");
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Map<String, Object> signatureOf(String resultJson) {
+        Map<String, Object> r = ok(resultJson);
+        List<Map<String, Object>> signatures = (List<Map<String, Object>>) r.get("signatures");
+        assertEquals(1, signatures.size(), resultJson);
+        return signatures.get(0);
+    }
+
+    @SuppressWarnings("unchecked")
+    private static String errorMessage(String json) {
+        Map<String, Object> m = parse(json);
+        assertEquals(Boolean.FALSE, m.get("ok"), json);
+        return (String) ((Map<String, Object>) m.get("error")).get("message");
     }
 
     // ------------------------------------------------------------------ helpers

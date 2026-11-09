@@ -7,11 +7,16 @@ package it.codingduck.dssnative.engine;
 
 import java.nio.ByteBuffer;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.function.Supplier;
 
 import org.slf4j.LoggerFactory;
+
+import eu.europa.esig.dss.model.DSSDocument;
+import eu.europa.esig.dss.model.InMemoryDocument;
 
 /**
  * The JSON-in/JSON-out contract behind the C API. One engine per isolate (static state is per isolate in
@@ -19,6 +24,14 @@ import org.slf4j.LoggerFactory;
  * FFI layer only converts strings.
  */
 public final class DssJsonApi {
+
+    /**
+     * Version of the C/JSON contract this library speaks, reported as {@code api_version} by {@link #version()}.
+     * Bumped on an incompatible change (a removed or renamed field, a changed verdict or error code meaning, a
+     * changed C signature); additive changes keep it. Callers that know a different version should refuse the
+     * library rather than guess at the contract.
+     */
+    public static final int API_VERSION = 1;
 
     private static volatile DssEngine engine;
     private static final Object INIT_LOCK = new Object();
@@ -36,7 +49,7 @@ public final class DssJsonApi {
                 throw new DssError(DssError.Code.INVALID_ARGUMENT, "cache_dir is required");
             }
             EngineConfig config = EngineConfig.fromJson(configJson);
-            applyLogLevel(config.logLevel);
+            String effectiveLogLevel = applyLogLevel(config.logLevel);
             DssEngine created = DssEngine.create(Path.of(cacheDir), config);
             DssEngine previous;
             synchronized (INIT_LOCK) {
@@ -48,17 +61,30 @@ public final class DssJsonApi {
             }
             Map<String, Object> m = new LinkedHashMap<>();
             m.put("trusted_lists_loaded", created.trustedListStatus().get("loaded"));
+            m.put("oj_keystore", created.ojKeystore());
+            m.put("log_level", effectiveLogLevel);
             m.put("initial_load", created.initialLoad().toMap());
             return m;
         });
     }
 
+    /**
+     * Runs an online refresh. {@code TL_REFRESH_FAILED} when it published nothing (DSS's job threw, or what it
+     * built was unusable: the previous lists are kept); per-list problems are in the status, not here.
+     */
     public static String refreshTrustedListsOnline() {
-        return call(() -> {
-            Map<String, Object> m = new LinkedHashMap<>();
-            m.put("refresh", requireEngine().refreshTrustedListsOnline().toMap());
-            return m;
-        });
+        return call(() -> refreshResult(requireEngine().refreshTrustedListsOnline()));
+    }
+
+    static Map<String, Object> refreshResult(TrustedListManager.RefreshRecord record) {
+        if (!record.completed()) {
+            throw new DssError(DssError.Code.TL_REFRESH_FAILED, "the online refresh published no trusted lists"
+                    + (record.error() == null ? "" : ": " + record.error()) + "; the lists loaded before (if any) "
+                    + "are kept, see dss_tl_status");
+        }
+        Map<String, Object> m = new LinkedHashMap<>();
+        m.put("refresh", record.toMap());
+        return m;
     }
 
     public static String trustedListStatus() {
@@ -93,6 +119,46 @@ public final class DssJsonApi {
         return call(() -> {
             DssEngine engine = requireEngine();
             return engine.validate(copy(document), ValidationOptions.fromJson(optionsJson)).toMap();
+        });
+    }
+
+    /**
+     * The signed content of a detached signature, as bytes: {@code bytes} is read from its position to its limit
+     * (neither changes); {@code name} may be null.
+     */
+    public record DetachedContent(String name, ByteBuffer bytes) {
+    }
+
+    /**
+     * As {@link #validate(ByteBuffer, String)}, with the signed content of a detached signature passed as buffers
+     * instead of base64 inside {@code options_json} (the route behind {@code dss_validate_with_contents}). Each
+     * content is added to the options' {@code detached_contents} before any entry the JSON already carries,
+     * exactly as if it had been sent as {@code {"name":…,"base64":…}}; the bytes are copied into the Java heap
+     * once, inside the error handling, so a content too large for the heap is an {@code INTERNAL_ERROR} result.
+     * A null or empty {@code contents} makes this {@link #validate(ByteBuffer, String)}; a null or empty content
+     * is {@code INVALID_ARGUMENT} ({@code contents[i] is NULL} / {@code contents[i] is empty}), as the JSON route
+     * refuses an empty {@code base64}.
+     */
+    public static String validate(ByteBuffer document, String optionsJson, List<DetachedContent> contents) {
+        return call(() -> {
+            DssEngine engine = requireEngine();
+            ValidationOptions options = ValidationOptions.fromJson(optionsJson);
+            if (contents != null && !contents.isEmpty()) {
+                List<DSSDocument> merged = new ArrayList<>(contents.size() + options.detachedContents.size());
+                for (int i = 0; i < contents.size(); i++) {
+                    DetachedContent content = contents.get(i);
+                    if (content == null || content.bytes() == null) {
+                        throw new DssError(DssError.Code.INVALID_ARGUMENT, "contents[" + i + "] is NULL");
+                    }
+                    if (content.bytes().remaining() == 0) {
+                        throw new DssError(DssError.Code.INVALID_ARGUMENT, "contents[" + i + "] is empty");
+                    }
+                    merged.add(new InMemoryDocument(copy(content.bytes()), content.name()));
+                }
+                merged.addAll(options.detachedContents);
+                options = options.withDetachedContents(merged);
+            }
+            return engine.validate(copy(document), options).toMap();
         });
     }
 
@@ -166,7 +232,11 @@ public final class DssJsonApi {
         return bytes;
     }
 
-    /** Drops the engine (used when the isolate is torn down). */
+    /**
+     * Drops the engine (used when the isolate is torn down). {@code trusted_list_threads_stopped} says whether its
+     * trusted-list threads ended within the wait; a thread still inside an HTTP read ends when the socket timeout
+     * does, and an isolate teardown waits for it.
+     */
     public static String shutdown() {
         return call(() -> {
             DssEngine previous;
@@ -174,10 +244,14 @@ public final class DssJsonApi {
                 previous = engine;
                 engine = null;
             }
+            boolean stopped = true;
             if (previous != null) {
                 previous.close();
+                stopped = previous.trustedListThreadsStopped();
             }
-            return new LinkedHashMap<>();
+            Map<String, Object> m = new LinkedHashMap<>();
+            m.put("trusted_list_threads_stopped", stopped);
+            return m;
         });
     }
 
@@ -214,13 +288,17 @@ public final class DssJsonApi {
         }
     }
 
-    /** Library, DSS and runtime versions (from the Maven-filtered {@code version.properties}). */
+    /**
+     * Library, DSS and runtime versions (from the Maven-filtered {@code version.properties}) plus
+     * {@code api_version}, the integer {@link #API_VERSION} of the C/JSON contract.
+     */
     public static String version() {
         return call(() -> {
             Map<String, Object> m = new LinkedHashMap<>();
             m.put("library", BuildInfo.library());
             m.put("dss", BuildInfo.dss());
             m.put("runtime", System.getProperty("java.vm.name") + " " + System.getProperty("java.vm.version"));
+            m.put("api_version", (long) API_VERSION);
             return m;
         });
     }
@@ -236,14 +314,33 @@ public final class DssJsonApi {
         return Json.write(result);
     }
 
+    /** Loggers that print request headers, and with them the TSA's Basic credentials, at debug. */
+    static final List<String> SECRET_BEARING_LOGGERS = List.of("org.apache.hc.client5.http.headers",
+            "org.apache.hc.client5.http.wire");
+
     /**
      * slf4j-simple reads its level once, when the first logger is created. In the native library dss_init is the
-     * first call, so setting the property here works; on the JVM it only applies if nothing logged before.
+     * first call, so setting the property here works; a later dss_init on the same isolate cannot change it, and
+     * on the JVM it only applies if nothing logged before. The level in force is returned (and reported by init),
+     * so a caller sees when the one it asked for did not take. Whatever the level, Apache HttpClient's header
+     * and wire loggers are held at info: at debug they print {@code Authorization: Basic …} to the TSA.
+     *
+     * @return the level slf4j-simple uses
      */
-    private static void applyLogLevel(String level) {
-        if (System.getProperty("org.slf4j.simpleLogger.defaultLogLevel") == null) {
-            System.setProperty("org.slf4j.simpleLogger.defaultLogLevel", level);
+    static String applyLogLevel(String level) {
+        for (String logger : SECRET_BEARING_LOGGERS) {
+            System.setProperty("org.slf4j.simpleLogger.log." + logger, "info");
+        }
+        String property = "org.slf4j.simpleLogger.defaultLogLevel";
+        if (System.getProperty(property) == null) {
+            System.setProperty(property, level);
         }
         System.setProperty("org.slf4j.simpleLogger.logFile", "System.err");
+        String effective = System.getProperty(property);
+        if (!effective.equalsIgnoreCase(level)) {
+            LoggerFactory.getLogger(DssJsonApi.class).warn("log_level '{}' requested, but the logging level was "
+                    + "fixed at '{}' when the process first logged and cannot change", level, effective);
+        }
+        return effective;
     }
 }

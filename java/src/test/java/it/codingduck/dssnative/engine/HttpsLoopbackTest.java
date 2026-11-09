@@ -57,6 +57,8 @@ class HttpsLoopbackTest {
     private final AtomicInteger tsaGranted = new AtomicInteger();
     private final AtomicInteger tsaUnauthorized = new AtomicInteger();
     private volatile String tsaContentType;
+    /** When set, /DE.xml answers a 302 to this URL. */
+    private volatile String deRedirect;
 
     @BeforeEach
     void startServer() throws Exception {
@@ -111,6 +113,11 @@ class HttpsLoopbackTest {
                 exchange.sendResponseHeaders(302, -1);
                 return;
             }
+            if (path.equals("/DE.xml") && deRedirect != null) {
+                exchange.getResponseHeaders().add("Location", deRedirect);
+                exchange.sendResponseHeaders(302, -1);
+                return;
+            }
             byte[] body;
             try {
                 body = content.get(base + path);
@@ -136,13 +143,18 @@ class HttpsLoopbackTest {
     }
 
     private DssEngine engine(String http, String tsa) {
+        return engine(http, tsa, tmp.resolve("cache"));
+    }
+
+    private DssEngine engine(String http, String tsa, Path cache) {
         String config = "{\"lotl_url\":\"" + base + "/eu-lotl.xml\","
                 + "\"oj_url\":\"" + SyntheticTrustedLists.OJ_URL + "\","
                 + "\"oj_keystore\":{\"path\":\"" + json(t.ojKeystore) + "\",\"password\":\"dss-password\"},"
                 + "\"revocation\":\"offline\",\"aia\":false,"
                 + (tsa == null ? "" : "\"tsa\":" + tsa + ",")
-                + "\"http\":{" + http + "}}";
-        return DssEngine.create(tmp.resolve("cache"), EngineConfig.fromJson(config));
+                // The server is on 127.0.0.1, which the outbound policy refuses by default.
+                + "\"http\":{\"block_private_addresses\":false" + (http.isEmpty() ? "" : "," + http) + "}}";
+        return DssEngine.create(cache, EngineConfig.fromJson(config));
     }
 
     @Test
@@ -163,7 +175,8 @@ class HttpsLoopbackTest {
         try (DssEngine engine = engine(trustStore, tsa + "wrong\"}")) {
             engine.refreshTrustedListsOnline();
             DssError e = assertThrows(DssError.class, () -> engine.extend(Fixtures.read("pades/b-lt.pdf"), lta));
-            assertEquals(DssError.Code.EXTENSION_FAILED, e.code(), e.getMessage());
+            assertEquals(DssError.Code.TSA_FAILED, e.code(), e.getMessage());
+            assertTrue(e.getMessage().contains("401"), e.getMessage());
             assertTrue(tsaUnauthorized.get() > 0);
         }
     }
@@ -177,6 +190,37 @@ class HttpsLoopbackTest {
             assertEquals(3, rec.trustedCertificates(), Json.write(engine.trustedListStatus()));
             assertEquals("TOTAL_PASSED/-", FixtureValidationTest.verdicts(
                     engine.validate(Fixtures.read("pades/b-lta.pdf"), ValidationOptions.DEFAULT)).get(0));
+        }
+    }
+
+    /**
+     * Redirects go through the real Apache client, which is told to stop at them so that the outbound policy
+     * can check each target: /IT.xml's redirect (same scheme) is followed, one to a scheme outside
+     * {@code allowed_schemes} is not, and {@code follow_redirects: false} follows none.
+     */
+    @Test
+    void redirectsAreCheckedByTheOutboundPolicy() {
+        deRedirect = "http://127.0.0.1:1/de-moved.xml"; // never contacted: the scheme is refused first
+        try (DssEngine engine = engine("\"allowed_schemes\":[\"https\"]")) {
+            TrustedListManager.RefreshRecord rec = engine.refreshTrustedListsOnline();
+            assertTrue(rec.completed());
+            assertEquals(2, rec.trustedCertificates(), "IT (through its redirect) loads, DE does not");
+            Map<String, Object> status = engine.trustedListStatus();
+            Map<String, Object> de = TrustedListTest.byUrl(status, base + "/DE.xml");
+            String error = String.valueOf(TrustedListTest.map(de, "download").get("error"));
+            assertTrue(error.contains("redirect from " + base + "/DE.xml refused"), error);
+            assertTrue(error.contains("scheme 'http'"), error);
+            assertEquals("TOTAL_PASSED", TrustedListTest.map(TrustedListTest.byUrl(status, base + "/IT.xml"), "validation")
+                    .get("indication"));
+        }
+        deRedirect = null;
+        try (DssEngine engine = engine("\"follow_redirects\":false", null, tmp.resolve("cache-no-redirects"))) {
+            TrustedListManager.RefreshRecord rec = engine.refreshTrustedListsOnline();
+            assertTrue(rec.completed());
+            assertEquals(1, rec.trustedCertificates(), "only DE: IT sits behind a redirect");
+            String error = String.valueOf(TrustedListTest.map(TrustedListTest.byUrl(engine.trustedListStatus(),
+                    base + "/IT.xml"), "download").get("error"));
+            assertTrue(error.contains("302"), error);
         }
     }
 

@@ -16,13 +16,20 @@ root="$(cd "$(dirname "$0")/.." && pwd)"
 cache_dir="${1:?usage: seed-tl-cache.sh <cache_dir> [config.json]}"
 config="${2:-}"
 mkdir -p "$cache_dir"
+# Both made absolute before the cd into java/, where Maven runs the seeder. Relative paths *inside* the config
+# (oj_keystore.path, ...) are resolved against the process's working directory, java/: write them absolute.
 cache_dir="$(cd "$cache_dir" && pwd)"
 if [[ -z "$config" ]]; then
   config="$(mktemp)"
   trap 'rm -f "$config"' EXIT
-  printf '{"oj_keystore":{"path":"%s"}}' "$root/trust/oj-keystore.p12" > "$config"
+  ks="$root/trust/oj-keystore.p12"; ks="${ks//\\/\\\\}"; ks="${ks//\"/\\\"}"
+  printf '{"oj_keystore":{"path":"%s"}}' "$ks" > "$config"
+else
+  [[ -f "$config" ]] || { echo "no config file $config" >&2; exit 1; }
+  config="$(cd "$(dirname "$config")" && pwd)/$(basename "$config")"
 fi
 cd "$root/java"
+# exec.args is split again by exec-maven-plugin, on whitespace outside quotes: each argument is quoted.
 ./mvnw -q -B compile exec:java \
   -Dexec.mainClass=it.codingduck.dssnative.engine.CacheSeeder \
-  -Dexec.args="$cache_dir $config"
+  -Dexec.args="\"$cache_dir\" \"$config\""

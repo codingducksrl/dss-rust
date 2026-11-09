@@ -43,8 +43,10 @@
 //! ```
 //!
 //! The library owns the EU trusted lists: [`Engine::refresh_trusted_lists`] refreshes them online (the
-//! application decides when, or uses [`schedule::RefreshScheduler`] with the `tokio` feature), and
-//! [`Engine::trusted_list_status`] reports their state.
+//! application decides when, or uses the `RefreshScheduler` of the `schedule` module with the `tokio` feature),
+//! and [`Engine::trusted_list_status`] reports their state.
+#![cfg_attr(feature = "tokio", doc = "\nThe scheduler: [`schedule::RefreshScheduler`].")]
+#![warn(missing_docs)]
 
 mod config;
 mod engine;
@@ -55,13 +57,14 @@ mod types;
 pub mod schedule;
 
 pub use config::{
-    Config, DetachedContent, DigestAlgorithm, ExtendOptions, Http, ImagePosition, Level, OjKeystore, Options,
-    Packaging, PadesOptions, Placement, Report, Revocation, SignOptions, SignatureFormat, SigningMode, TextAlign,
-    TlSync, TrustStore, Tsa, VisibleSignature,
+    Config, DetachedBytes, DetachedContent, DigestAlgorithm, ExtendOptions, Http, ImagePosition, Level, Limits,
+    OjKeystore, Options, Packaging, PadesOptions, Placement, Proxy, Report, Revocation, SignOptions, SignatureFormat,
+    SigningMode, TextAlign, TlSync, TrustStore, Tsa, VisibleSignature,
 };
-pub use engine::{Engine, EngineBuilder};
+pub use engine::{API_VERSION, CancelToken, Cancellable, Engine, EngineBuilder, library_version};
 pub use error::{Error, ErrorCode, Result};
 pub use types::{
-    Alert, Extended, Indication, InitInfo, ListStatus, PreparedSignature, RefreshRecord, Reports, SignatureSummary,
-    Signed, Stage, TlSnapshot, TlSnapshotInfo, TrustedListStatus, Version,
+    Alert, Changes, Extended, Indication, InitInfo, ListStatus, OjKeystoreInfo, Policy, PreparedSignature,
+    RefreshRecord, Reports, SignatureSummary, Signed, Stage, TimestampSummary, TlSnapshot, TlSnapshotInfo,
+    TrustedListStatus, Version,
 };

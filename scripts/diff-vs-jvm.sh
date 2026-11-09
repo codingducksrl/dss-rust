@@ -25,7 +25,7 @@ done
 
 work="$root/build/diff"
 mkdir -p "$work"
-(cd "$root/rust" && cargo build -q --release -p dss-cli)
+(cd "$root/rust" && cargo build -q --locked --release -p dss-cli)
 cli="$root/rust/target/release/dss-cli"
 (cd "$root/java" && ./mvnw -q -B test-compile)
 validation_time="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -34,6 +34,9 @@ status=0
 # Failures that only a native image produces. Libraries often catch and log them (PDFBox fell back to another
 # charset this way), so the verdicts can still agree: the native log is checked as well.
 native_only='Missing[A-Za-z]*RegistrationError|UnsupportedCharsetException|UnsupportedFeatureError|UnsatisfiedLinkError|NoClassDefFoundError'
+
+# exec.args is split again by exec-maven-plugin, on whitespace outside quotes: each argument is quoted.
+q() { printf '"%s"' "$1"; }
 
 # compare <name> <config> <cache> <cases>
 compare() {
@@ -48,7 +51,7 @@ compare() {
   (cd "$root/java" && ./mvnw -q -B exec:java -Dexec.classpathScope=test \
     -Dexec.mainClass=it.codingduck.dssnative.diff.DiffVsNative \
     -Dorg.slf4j.simpleLogger.defaultLogLevel=error \
-    -Dexec.args="--name $name --config $config --cache $cache --cases $cases --native $work/$name.native.jsonl --validation-time $validation_time --report $work/$name.md --base $root") \
+    -Dexec.args="--name $(q "$name") --config $(q "$config") --cache $(q "$cache") --cases $(q "$cases") --native $(q "$work/$name.native.jsonl") --validation-time $(q "$validation_time") --report $(q "$work/$name.md") --base $(q "$root")") \
     || status=1
 }
 
@@ -57,7 +60,7 @@ synthetic="$work/synthetic"
 rm -rf "$synthetic"
 (cd "$root/java" && ./mvnw -q -B exec:java -Dexec.classpathScope=test \
   -Dexec.mainClass=it.codingduck.dssnative.testsupport.SyntheticCacheSeeder \
-  -Dexec.args="$synthetic" -Ddssnative.repoRoot="$root" -Dorg.slf4j.simpleLogger.defaultLogLevel=error) >/dev/null
+  -Dexec.args="$(q "$synthetic")" -Ddssnative.repoRoot="$root" -Dorg.slf4j.simpleLogger.defaultLogLevel=error) >/dev/null
 fx="$root/testdata/fixtures"
 {
   find "$fx" -type f ! -path "*/pki/*" ! -name "README.md" | sort
@@ -84,7 +87,8 @@ if [[ -n "$(mapfile_cases)" ]]; then
       config="$priv/config.json"
     else
       config="$work/real-config.json"
-      printf '{"oj_keystore":{"path":"%s"},"revocation":"online","log_level":"error"}' "$root/trust/oj-keystore.p12" > "$config"
+      ks="$root/trust/oj-keystore.p12"; ks="${ks//\\/\\\\}"; ks="${ks//\"/\\\"}"
+      printf '{"oj_keystore":{"path":"%s"},"revocation":"online","log_level":"error"}' "$ks" > "$config"
     fi
   fi
   cache="${private_cache:-$work/real-cache}"

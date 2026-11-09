@@ -5,6 +5,7 @@
 
 #![allow(dead_code)]
 
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -25,8 +26,42 @@ pub fn read_fixture(rel: &str) -> Vec<u8> {
     std::fs::read(fixture(rel)).unwrap_or_else(|e| panic!("fixture {rel}: {e}"))
 }
 
-/// A fresh directory under cargo's per-target temp dir.
-pub fn temp_dir(name: &str) -> PathBuf {
+/// A fresh directory under cargo's per-target temp dir, removed when dropped. Keep it alive as long as the engine
+/// that uses it: declare it before the engine, so that the engine is dropped first.
+pub struct TempDir(PathBuf);
+
+impl TempDir {
+    pub fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Deref for TempDir {
+    type Target = Path;
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl AsRef<Path> for TempDir {
+    fn as_ref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl From<&TempDir> for PathBuf {
+    fn from(dir: &TempDir) -> PathBuf {
+        dir.0.clone()
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+pub fn temp_dir(name: &str) -> TempDir {
     static N: AtomicUsize = AtomicUsize::new(0);
     let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
         "{name}-{}-{}",
@@ -35,7 +70,7 @@ pub fn temp_dir(name: &str) -> PathBuf {
     ));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    dir
+    TempDir(dir)
 }
 
 /// No trusted lists, the synthetic test root trusted directly, embedded revocation only: works offline with
@@ -49,9 +84,24 @@ pub fn offline_config() -> Config {
     c
 }
 
-pub fn offline_engine(workers: usize) -> Engine {
-    EngineBuilder::new(temp_dir("cache"), &offline_config())
+/// An engine with its own cache directory, which goes away with it.
+pub struct TestEngine {
+    engine: Engine,
+    _cache: TempDir,
+}
+
+impl Deref for TestEngine {
+    type Target = Engine;
+    fn deref(&self) -> &Engine {
+        &self.engine
+    }
+}
+
+pub fn offline_engine(workers: usize) -> TestEngine {
+    let cache = temp_dir("cache");
+    let engine = EngineBuilder::new(&cache, &offline_config())
         .workers(workers)
         .build()
-        .expect("engine")
+        .expect("engine");
+    TestEngine { engine, _cache: cache }
 }

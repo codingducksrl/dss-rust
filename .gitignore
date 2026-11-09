@@ -1,14 +1,18 @@
-# Build outputs
+# Build outputs (/target/: test output some suites write next to the repository root)
 java/target/
 rust/target/
+/target/
 /build/
 
 # Real signed documents may contain personal data: never commit them.
 testdata/private/*
 !testdata/private/README.md
 
-# Local trusted-list caches (a seed snapshot is produced by CI, not committed)
+# Local trusted-list caches (a seed snapshot is produced by CI, not committed). dss-cache is dss-server's default
+# --cache-dir (dss-cli defaults to the user's cache directory); tl-cache the one scripts/seed-tl-cache.sh is
+# documented with.
 /tl-cache/
+/dss-cache/
 
 # IDE / OS
 .idea/

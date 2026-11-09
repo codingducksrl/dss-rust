@@ -61,7 +61,9 @@ import it.codingduck.dssnative.engine.EngineConfig;
  * <ul>
  *   <li>trusted lists synchronized only when their signature is valid ({@code tl_sync});</li>
  *   <li>PDF visual comparison off;</li>
- *   <li>base64/PEM-wrapped input decoded before validation;</li>
+ *   <li>base64/PEM-wrapped input decoded before validation (at most three layers), and input that is then neither
+ *       a PDF nor a CMS {@code ContentInfo} refused as unsupported without asking DSS, by the same rules as the
+ *       engine's input normalizer, written again here ({@link #looksLikeCms}, {@link #looksLikePdf});</li>
  *   <li>a CAdES envelope inside the signed content validated as a nested level.</li>
  * </ul>
  */
@@ -118,11 +120,23 @@ public final class PlainDssReference implements AutoCloseable {
         return trustedLists.getNumberOfCertificates();
     }
 
+    /**
+     * Rejections carry the code the engine is expected to give: INVALID_ARGUMENT for an empty document,
+     * UNSUPPORTED_DOCUMENT for one that is neither a PDF nor a CMS after decoding, VALIDATION_FAILED when DSS
+     * itself cannot process it.
+     */
     public Outcome validate(byte[] input, List<Path> detached, Date validationTime) {
+        if (input == null || input.length == 0) {
+            return Outcome.rejected("INVALID_ARGUMENT", "document is empty");
+        }
+        byte[] bytes = decode(input);
+        if (bytes == null) {
+            return Outcome.rejected("UNSUPPORTED_DOCUMENT", "neither a PDF nor a CMS ContentInfo");
+        }
         try {
-            return validate(decode(input), detached, validationTime, 0);
+            return validate(bytes, detached, validationTime, 0);
         } catch (RuntimeException e) {
-            return Outcome.rejected(e.getClass().getSimpleName() + ": " + e.getMessage());
+            return Outcome.rejected("VALIDATION_FAILED", e.getClass().getSimpleName() + ": " + e.getMessage());
         }
     }
 
@@ -167,7 +181,7 @@ public final class PlainDssReference implements AutoCloseable {
                 nested.add(validate(inner, List.of(), validationTime, depth + 1));
             }
         }
-        return new Outcome(null, sigs, nested);
+        return new Outcome(sigs, nested);
     }
 
     private CommonCertificateVerifier verifier() {
@@ -191,36 +205,78 @@ public final class PlainDssReference implements AutoCloseable {
                 return null;
             }
             byte[] content = decode(DSSUtils.toByteArray(originals.get(0)));
-            return content.length > 1 && (content[0] & 0xFF) == 0x30 ? content : null;
+            return content != null && looksLikeCms(content) ? content : null;
         } catch (RuntimeException e) {
             return null;
         }
     }
 
-    /** Base64 (optionally PEM-armoured) text to bytes; anything starting like DER or PDF is left alone. */
+    /** Transport encodings removed at most, as in the engine (base64 of base64 of base64 still works). */
+    private static final int MAX_DECODE_ROUNDS = 3;
+
+    /**
+     * The PDF or CMS inside up to {@value #MAX_DECODE_ROUNDS} layers of base64 (optionally PEM-armoured) text,
+     * or null when there is none.
+     */
     static byte[] decode(byte[] input) {
         byte[] bytes = input;
-        for (int round = 0; round < 3; round++) {
-            if (bytes.length > 1 && (bytes[0] & 0xFF) == 0x30) {
+        for (int round = 0; ; round++) {
+            if (looksLikeCms(bytes) || looksLikePdf(bytes)) {
                 return bytes;
             }
-            String head = new String(bytes, 0, Math.min(bytes.length, 1024), StandardCharsets.ISO_8859_1);
-            if (head.contains("%PDF-")) {
-                return bytes;
+            if (round == MAX_DECODE_ROUNDS) {
+                return null;
             }
-            StringBuilder b64 = new StringBuilder();
-            for (String line : new String(bytes, StandardCharsets.US_ASCII).split("\\R")) {
-                if (!line.startsWith("-----")) {
-                    b64.append(line.strip());
+            String text = new String(bytes, StandardCharsets.ISO_8859_1);
+            if (text.substring(0, Math.min(text.length(), 64 + 10)).contains("-----BEGIN")) {
+                // PEM: the armour lines and any header lines ("Proc-Type: ...") are not base64
+                StringBuilder body = new StringBuilder();
+                for (String line : text.split("\\R")) {
+                    if (!line.startsWith("-----") && !line.contains(":")) {
+                        body.append(line);
+                    }
                 }
+                text = body.toString();
+            }
+            text = text.replaceAll("[ \\t\\n\\r\\x0B\\f]+", "");
+            if (text.length() < 4 || !text.matches("[A-Za-z0-9+/=_-]+")) {
+                return null;
             }
             try {
-                bytes = Base64.getMimeDecoder().decode(b64.toString().replace('-', '+').replace('_', '/'));
+                boolean urlSafe = text.indexOf('-') >= 0 || text.indexOf('_') >= 0;
+                bytes = (urlSafe ? Base64.getUrlDecoder() : Base64.getDecoder()).decode(text);
             } catch (IllegalArgumentException e) {
-                return input;
+                return null;
             }
         }
-        return bytes;
+    }
+
+    /** PDF 1.7 section 7.5.2: the header may be anywhere in the first 1024 bytes. */
+    static boolean looksLikePdf(byte[] b) {
+        String head = new String(b, 0, Math.min(b.length, 1024 + 5), StandardCharsets.ISO_8859_1);
+        int at = head.indexOf("%PDF-");
+        return at >= 0 && at <= 1024;
+    }
+
+    /**
+     * A CMS {@code ContentInfo}: a SEQUENCE (0x30) with a well-formed length (short, long of one to four bytes, or
+     * BER indefinite) whose first element is an OBJECT IDENTIFIER (0x06), the contentType. Text that starts with
+     * '0' ("0 items in stock") or base64 that decodes to a 0x30 byte ("MAIL") is not; a truncated CMS still is.
+     */
+    static boolean looksLikeCms(byte[] b) {
+        if (b.length < 4 || (b[0] & 0xFF) != 0x30) {
+            return false;
+        }
+        int first = b[1] & 0xFF;
+        int header = 2;
+        if (first > 0x80) {
+            int lengthBytes = first & 0x7F;
+            if (lengthBytes > 4) {
+                return false;
+            }
+            header += lengthBytes;
+        }
+        return header < b.length && (b[header] & 0xFF) == 0x06;
     }
 
     @Override

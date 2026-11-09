@@ -11,15 +11,20 @@ import java.awt.Graphics2D;
 import java.awt.image.BufferedImage;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.io.OutputStream;
+import java.math.BigInteger;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
+import java.security.SecureRandom;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.Base64;
 import java.util.Date;
 import java.util.EnumSet;
 import java.util.List;
+import java.util.Map;
 import java.util.function.Function;
 
 import javax.imageio.ImageIO;
@@ -65,8 +70,13 @@ import eu.europa.esig.dss.model.DigestDocument;
 import eu.europa.esig.dss.model.InMemoryDocument;
 import eu.europa.esig.dss.model.ToBeSigned;
 import eu.europa.esig.dss.pades.PAdESSignatureParameters;
+import eu.europa.esig.dss.pades.PAdESTimestampParameters;
 import eu.europa.esig.dss.pades.signature.PAdESService;
+import eu.europa.esig.dss.pdf.PDFServiceMode;
+import eu.europa.esig.dss.pdf.PDFSignatureService;
 import eu.europa.esig.dss.pdf.pdfbox.PdfBoxNativeObjectFactory;
+import eu.europa.esig.dss.pdf.pdfbox.PdfBoxSignatureService;
+import eu.europa.esig.dss.pdf.pdfbox.visible.PdfBoxSignatureDrawerFactory;
 import eu.europa.esig.dss.service.crl.OnlineCRLSource;
 import eu.europa.esig.dss.spi.DSSUtils;
 import eu.europa.esig.dss.spi.validation.CommonCertificateVerifier;
@@ -85,22 +95,49 @@ import it.codingduck.dssnative.testsupport.TestPki.Entity;
  *
  * <p>Every signed file has a {@code tampered/} twin in which one byte of the signed content was changed.
  * The marker string makes that byte easy to find in DER, BER (chunked) and uncompressed PDF content.
+ *
+ * <p>Reproducible: nothing depends on the current time or on unseeded randomness. Signing times are the start of
+ * a fixture clock ({@link #DEFAULT_TIME}, or {@code --time=<instant>}); each timestamp, CRL and PDF file
+ * identifier takes the next minute of that clock, in the order the generator asks for them; the ECDSA signatures
+ * and the encrypted PDF's IVs come from a seeded {@link TestPki#deterministicRandom}. One thing is left to the JVM:
+ * DSS collects the certificates and revocation data of a PAdES DSS dictionary in hash sets whose order follows
+ * enum identity hash codes, which differ from one JVM to the next; run the generator with {@link #JVM_OPTIONS}
+ * (every identity hash code is then 1) and it is fixed too. So with the same PKI, the same time, those JVM options
+ * and the same JDK and dependencies, a regeneration gives the same bytes. {@code --out=<dir>} writes into another
+ * directory (with a copy of the committed PKI and {@code stamp.jpg}), to compare a regeneration with the committed
+ * files.
  */
 public final class FixtureGenerator {
 
     /** Present in every signed payload; the tampered variants flip its first letter. */
     static final String MARKER = "DSS-NATIVE-SYNTHETIC-CONTENT";
 
+    /** Where the fixture clock starts unless {@code --time=} says otherwise: the signing time of every fixture. */
+    static final Instant DEFAULT_TIME = Instant.parse("2026-11-01T09:00:00Z");
+
+    /**
+     * HotSpot options for the JVM that runs the generator: every identity hash code is 1, so the order of DSS's
+     * hash sets (and with it the PAdES DSS dictionaries) is the same in every run. Slow for identity-keyed maps,
+     * harmless for one generator run.
+     */
+    public static final List<String> JVM_OPTIONS = List.of("-XX:+UnlockExperimentalVMOptions", "-XX:hashCode=2");
+
     private final Path out;
     private final TestPki pki;
+    private final Instant start;
+    private final SecureRandom random;
+    private int ticks;
     private final FakeHttp http = new FakeHttp();
     private final CommonCertificateVerifier verifier = new CommonCertificateVerifier();
     private final KeyEntityTSPSource tsp;
 
-    private FixtureGenerator(Path out, TestPki pki) {
+    private FixtureGenerator(Path out, TestPki pki, Instant start) {
         this.out = out;
         this.pki = pki;
-        http.route(TestPki.CRL_URL, pki::freshCrl);
+        this.start = start.truncatedTo(ChronoUnit.SECONDS);
+        this.random = TestPki.deterministicRandom("dss-native fixtures/" + this.start);
+        http.route(TestPki.CRL_URL, () -> TestPki.crl(pki.x509(Entity.ROOT_CA), pki.key(Entity.ROOT_CA), Map.of(),
+                tick()));
         CommonTrustedCertificateSource trusted = new CommonTrustedCertificateSource();
         trusted.addCertificate(pki.token(Entity.ROOT_CA));
         verifier.setTrustedCertSources(trusted);
@@ -109,26 +146,163 @@ public final class FixtureGenerator {
         verifier.setCrlSource(crl);
         verifier.setOcspSource(null);
         verifier.setAIASource(null);
-        tsp = new KeyEntityTSPSource(pki.key(Entity.TSA), pki.x509(Entity.TSA),
-                List.of(pki.x509(Entity.TSA), pki.x509(Entity.ROOT_CA)));
-        tsp.setTsaPolicy("1.3.6.1.4.1.99999.1.1"); // arbitrary test policy OID
+        tsp = new ClockTspSource(pki);
+        tsp.setTsaPolicy(TestPki.TSA_POLICY);
     }
 
+    /**
+     * Arguments: {@code --new-pki} (also replace the PKI), {@code --signing-only} (only {@code signing/}, from the
+     * {@code content/} already in the output directory), {@code --out=<dir>} (default {@code testdata/fixtures};
+     * a directory without a PKI gets a copy of the committed one) and {@code --time=<ISO-8601 instant>} (default
+     * {@link #DEFAULT_TIME}).
+     */
     public static void main(String[] args) throws Exception {
-        boolean newPki = List.of(args).contains("--new-pki");
+        boolean newPki = false;
+        boolean signingOnly = false;
         Path dir = Fixtures.dir();
-        Path p12 = TestPki.defaultLocation();
-        if (List.of(args).contains("--signing-only")) {
-            FixtureGenerator generator = new FixtureGenerator(dir, TestPki.load(p12));
+        Instant time = DEFAULT_TIME;
+        for (String arg : args) {
+            if (arg.equals("--new-pki")) {
+                newPki = true;
+            } else if (arg.equals("--signing-only")) {
+                signingOnly = true;
+            } else if (arg.startsWith("--out=")) {
+                dir = Path.of(arg.substring("--out=".length())).toAbsolutePath();
+            } else if (arg.startsWith("--time=")) {
+                time = Instant.parse(arg.substring("--time=".length()));
+            } else {
+                throw new IllegalArgumentException("unknown argument " + arg
+                        + " (expected --new-pki, --signing-only, --out=<dir>, --time=<instant>)");
+            }
+        }
+        if (System.identityHashCode(new Object()) != 1 || System.identityHashCode(new Object()) != 1) {
+            System.err.println("warning: not reproducible: the PAdES LT/LTA fixtures depend on identity hash codes;"
+                    + " run the generator in a JVM started with " + String.join(" ", JVM_OPTIONS));
+        }
+        prepareOutput(dir, newPki);
+        Path stamp = dir.resolve("content/stamp.jpg");
+        if (!Files.exists(stamp)) {
+            // Drawn only when there is none: AWT's text rendering differs between machines, so redrawing it would
+            // make the regeneration differ too. Delete it to redraw it.
+            Files.createDirectories(stamp.getParent());
+            Files.write(stamp, stampJpeg());
+        }
+        Path p12 = dir.resolve("pki/test-pki.p12");
+        if (signingOnly) {
+            FixtureGenerator generator = new FixtureGenerator(dir, TestPki.load(p12), time);
             generator.generateVisibleContent(false);
             generator.generateSigning();
             System.out.println("Signing fixtures written to " + dir.resolve("signing"));
             return;
         }
         TestPki pki = newPki || !Files.exists(p12) ? TestPki.generate(p12) : TestPki.load(p12);
-        Files.writeString(dir.resolve("pki/root-ca.pem"), pki.pem(Entity.ROOT_CA));
-        new FixtureGenerator(dir, pki).generateAll();
+        generateAll(dir, pki, time);
         System.out.println("Fixtures written to " + dir);
+    }
+
+    /**
+     * For an output directory other than {@code testdata/fixtures}: copies the committed PKI (unless
+     * {@code newPki}) and {@code content/stamp.jpg} into it, where missing, so a regeneration there compares
+     * byte for byte with the committed files.
+     */
+    static void prepareOutput(Path dir, boolean newPki) throws IOException {
+        if (!newPki) {
+            copyIfMissing(TestPki.defaultLocation(), dir.resolve("pki/test-pki.p12"));
+        }
+        copyIfMissing(Fixtures.path("content/stamp.jpg"), dir.resolve("content/stamp.jpg"));
+    }
+
+    private static void copyIfMissing(Path from, Path to) throws IOException {
+        if (!Files.exists(to) && Files.exists(from)) {
+            Files.createDirectories(to.getParent());
+            Files.copy(from, to, StandardCopyOption.COPY_ATTRIBUTES);
+        }
+    }
+
+    /**
+     * Everything but the PKI and {@code content/stamp.jpg}, which must be there already ({@link #prepareOutput}):
+     * {@code pki/root-ca.pem}, the documents and {@code signing/}.
+     */
+    static void generateAll(Path out, TestPki pki, Instant time) throws Exception {
+        Files.createDirectories(out.resolve("pki"));
+        Files.writeString(out.resolve("pki/root-ca.pem"), pki.pem(Entity.ROOT_CA));
+        new FixtureGenerator(out, pki, time).generateAll();
+    }
+
+    /**
+     * The fixture clock: a minute after the previous call (the first: a minute after {@link #start}), so every
+     * timestamp follows the signing time and the timestamp before it, and the revocation data follows them.
+     */
+    private Instant tick() {
+        return start.plus(++ticks, ChronoUnit.MINUTES);
+    }
+
+    /** The test TSA, answering at the fixture clock's next minute with the tick count as serial number. */
+    private final class ClockTspSource extends KeyEntityTSPSource {
+        ClockTspSource(TestPki pki) {
+            super(pki.key(Entity.TSA), pki.x509(Entity.TSA), List.of(pki.x509(Entity.TSA), pki.x509(Entity.ROOT_CA)));
+        }
+
+        @Override
+        protected Date getProductionTime() {
+            return Date.from(tick());
+        }
+
+        @Override
+        protected BigInteger getTimeStampSerialNumber() {
+            return BigInteger.valueOf(ticks);
+        }
+    }
+
+    /**
+     * PDFBox derives the second half of a file identifier from the current time when the caller sets no document
+     * id; DSS sets one for signatures (from the signing time), not for the DSS dictionary of an extension. This
+     * factory's services fill the gap from the fixture clock.
+     */
+    private final class ClockPdfObjFactory extends PdfBoxNativeObjectFactory {
+        @Override
+        public PDFSignatureService newPAdESSignatureService() {
+            return configure(new ClockPdfSignatureService(PDFServiceMode.SIGNATURE, getSignatureDrawerFactory()));
+        }
+
+        @Override
+        public PDFSignatureService newContentTimestampService() {
+            return configure(new ClockPdfSignatureService(PDFServiceMode.CONTENT_TIMESTAMP,
+                    getSignatureDrawerFactory()));
+        }
+
+        @Override
+        public PDFSignatureService newSignatureTimestampService() {
+            return configure(new ClockPdfSignatureService(PDFServiceMode.SIGNATURE_TIMESTAMP,
+                    getSignatureDrawerFactory()));
+        }
+
+        @Override
+        public PDFSignatureService newArchiveTimestampService() {
+            return configure(new ClockPdfSignatureService(PDFServiceMode.ARCHIVE_TIMESTAMP,
+                    getSignatureDrawerFactory()));
+        }
+    }
+
+    private final class ClockPdfSignatureService extends PdfBoxSignatureService {
+        ClockPdfSignatureService(PDFServiceMode mode, PdfBoxSignatureDrawerFactory drawers) {
+            super(mode, drawers);
+        }
+
+        @Override
+        public void saveDocumentIncrementally(PDDocument pdDocument, OutputStream outputStream) {
+            if (pdDocument.getDocumentId() == null) {
+                pdDocument.setDocumentId(tick().toEpochMilli());
+            }
+            super.saveDocumentIncrementally(pdDocument, outputStream);
+        }
+    }
+
+    /** Timestamp parameters whose date (the /M of a document timestamp, and its file identifier) is given. */
+    private static final class FixedTimePAdESTimestampParameters extends PAdESTimestampParameters {
+        FixedTimePAdESTimestampParameters(Instant date) {
+            this.timestampDate = Date.from(date);
+        }
     }
 
     private void generateAll() throws Exception {
@@ -171,7 +345,7 @@ public final class FixtureGenerator {
         // --- PAdES
         byte[] bb = pades(pdf, SignatureLevel.PAdES_BASELINE_B);
         byte[] bt = pades(pdf, SignatureLevel.PAdES_BASELINE_T);
-        Thread.sleep(1500); // revocation must be issued strictly after the signature timestamp
+        // Revocation must be issued strictly after the signature timestamp: the fixture clock sees to that.
         byte[] blt = extend(bt, SignatureLevel.PAdES_BASELINE_LT);
         byte[] blta = extend(blt, SignatureLevel.PAdES_BASELINE_LTA);
         for (var e : List.of(new Object[] {"b-b", bb}, new Object[] {"b-t", bt}, new Object[] {"b-lt", blt},
@@ -195,10 +369,11 @@ public final class FixtureGenerator {
     private void generateSigning() throws Exception {
         byte[] pdf = Files.readAllBytes(out.resolve("content/document.pdf"));
         byte[] text = Files.readAllBytes(out.resolve("content/document.txt"));
-        String time = "\"signing_time\":\"" + Instant.now().truncatedTo(ChronoUnit.SECONDS) + "\"";
+        ticks = 0; // the clock restarts, so --signing-only writes what a full run writes here
+        String time = "\"signing_time\":\"" + start + "\"";
         String certificates = "\"signing_certificate\":\"" + base64(pki.x509(Entity.SIGNER_RSA).getEncoded())
                 + "\",\"certificate_chain\":[\"" + base64(pki.x509(Entity.ROOT_CA).getEncoded()) + "\"]";
-        ExternalSigner signer = new ExternalSigner(pki, Entity.SIGNER_RSA);
+        ExternalSigner signer = new ExternalSigner(pki, Entity.SIGNER_RSA, this::tick);
         Path work = Files.createTempDirectory("dss-native-fixtures");
         try (DssEngine engine = new TestEngines(work).engine(work.resolve("cache"), null)) {
             signingCase(engine, "pades-signature-value", pdf, "{\"mode\":\"signature_value\",\"level\":\"B\","
@@ -242,10 +417,11 @@ public final class FixtureGenerator {
     // ------------------------------------------------------------------ visible signatures
 
     /**
-     * Documents and an image for visible signatures: a form with an empty signature field ({@code Firma1}) and a
-     * text field, a page turned by {@code /Rotate 90}, an owner-password-protected copy of the document, and a
-     * JPEG (the only fixture made with ImageIO, which the native tests cannot use). With {@code overwrite} false,
-     * existing files are kept: signing fixtures depend on them.
+     * Documents for visible signatures: a form with an empty signature field ({@code Firma1}) and a text field, a
+     * page turned by {@code /Rotate 90} and an owner-password-protected copy of the document. With {@code overwrite}
+     * false, existing files are kept: signing fixtures depend on them. The JPEG for visible signatures
+     * ({@code content/stamp.jpg}, the only fixture made with ImageIO, which the native tests cannot use) is drawn
+     * by {@link #main} only when missing.
      */
     private void generateVisibleContent(boolean overwrite) throws IOException {
         if (overwrite || !Files.exists(out.resolve("content/form.pdf"))) {
@@ -257,12 +433,9 @@ public final class FixtureGenerator {
         if (overwrite || !Files.exists(out.resolve("content/protected.pdf"))) {
             write("content/protected.pdf", protectedPdf(Files.readAllBytes(out.resolve("content/document.pdf"))));
         }
-        if (overwrite || !Files.exists(out.resolve("content/stamp.jpg"))) {
-            write("content/stamp.jpg", stampJpeg());
-        }
     }
 
-    private static byte[] formPdf() throws IOException {
+    private byte[] formPdf() throws IOException {
         try (PDDocument doc = new PDDocument(); ByteArrayOutputStream bos = new ByteArrayOutputStream()) {
             PDPage page = new PDPage();
             doc.addPage(page);
@@ -292,12 +465,13 @@ public final class FixtureGenerator {
             nameWidget.setPage(page);
             page.getAnnotations().add(nameWidget);
             form.getFields().add(name);
+            doc.setDocumentId(documentId());
             doc.save(bos);
             return bos.toByteArray();
         }
     }
 
-    private static byte[] rotatedPdf() throws IOException {
+    private byte[] rotatedPdf() throws IOException {
         try (PDDocument doc = new PDDocument(); ByteArrayOutputStream bos = new ByteArrayOutputStream()) {
             PDPage page = new PDPage(PDRectangle.A4);
             page.setRotation(90);
@@ -310,17 +484,20 @@ public final class FixtureGenerator {
                 cs.showText("Synthetic landscape page (/Rotate 90) for dss-native tests.");
                 cs.endText();
             }
+            doc.setDocumentId(documentId());
             doc.save(bos);
             return bos.toByteArray();
         }
     }
 
     /** Opens without a password (empty user password), so it can be signed; the owner password restricts nothing. */
-    private static byte[] protectedPdf(byte[] pdf) throws IOException {
+    private byte[] protectedPdf(byte[] pdf) throws IOException {
         try (PDDocument doc = Loader.loadPDF(pdf); ByteArrayOutputStream bos = new ByteArrayOutputStream()) {
             StandardProtectionPolicy policy = new StandardProtectionPolicy("owner-secret", "", new AccessPermission());
             policy.setEncryptionKeyLength(128);
             doc.protect(policy);
+            doc.getEncryption().getSecurityHandler().setCustomSecureRandom(random); // the AES IVs
+            doc.setDocumentId(documentId());
             doc.save(bos);
             return bos.toByteArray();
         }
@@ -344,6 +521,11 @@ public final class FixtureGenerator {
         return bos.toByteArray();
     }
 
+    /** For PDFBox's file identifier of a new document, which it would otherwise derive from the current time. */
+    private long documentId() {
+        return start.toEpochMilli();
+    }
+
     private static String base64(byte[] bytes) {
         return Base64.getEncoder().encodeToString(bytes);
     }
@@ -361,10 +543,10 @@ public final class FixtureGenerator {
         p.setDigestAlgorithm(DigestAlgorithm.SHA256);
         p.setSigningCertificate(pki.token(signer));
         p.setCertificateChain(pki.chain(signer));
-        p.bLevel().setSigningDate(new Date());
+        p.bLevel().setSigningDate(Date.from(start));
         CAdESService service = new CAdESService(verifier);
         ToBeSigned tbs = service.getDataToSign(doc, p);
-        return service.signDocument(doc, p, Signing.sign(tbs, p.getDigestAlgorithm(), pki.key(signer)));
+        return service.signDocument(doc, p, Signing.sign(tbs, p.getDigestAlgorithm(), pki.key(signer), random));
     }
 
     private static byte[] toDer(DSSDocument cms) throws IOException {
@@ -421,7 +603,7 @@ public final class FixtureGenerator {
 
     // ------------------------------------------------------------------ PAdES
 
-    private static byte[] basePdf() throws IOException {
+    private byte[] basePdf() throws IOException {
         try (PDDocument doc = new PDDocument(); ByteArrayOutputStream bos = new ByteArrayOutputStream()) {
             PDPage page = new PDPage();
             doc.addPage(page);
@@ -438,6 +620,7 @@ public final class FixtureGenerator {
             }
             PDDocumentInformation info = doc.getDocumentInformation();
             info.setTitle("dss-native synthetic fixture");
+            doc.setDocumentId(documentId());
             doc.save(bos, CompressParameters.NO_COMPRESSION);
             return bos.toByteArray();
         }
@@ -446,7 +629,7 @@ public final class FixtureGenerator {
     private PAdESService padesService() {
         PAdESService service = new PAdESService(verifier);
         service.setTspSource(tsp);
-        service.setPdfObjFactory(new PdfBoxNativeObjectFactory());
+        service.setPdfObjFactory(new ClockPdfObjFactory());
         return service;
     }
 
@@ -456,7 +639,10 @@ public final class FixtureGenerator {
         p.setDigestAlgorithm(DigestAlgorithm.SHA256);
         p.setSigningCertificate(pki.token(Entity.SIGNER_RSA));
         p.setCertificateChain(pki.chain(Entity.SIGNER_RSA));
-        p.bLevel().setSigningDate(new Date());
+        p.bLevel().setSigningDate(Date.from(start));
+        if (level == SignatureLevel.PAdES_BASELINE_LTA) {
+            p.setArchiveTimestampParameters(new FixedTimePAdESTimestampParameters(tick()));
+        }
         p.setReason("dss-native fixture");
         return p;
     }
@@ -467,7 +653,7 @@ public final class FixtureGenerator {
         DSSDocument doc = new InMemoryDocument(pdf, "document.pdf");
         ToBeSigned tbs = service.getDataToSign(doc, p);
         return DSSUtils.toByteArray(service.signDocument(doc, p,
-                Signing.sign(tbs, p.getDigestAlgorithm(), pki.key(Entity.SIGNER_RSA))));
+                Signing.sign(tbs, p.getDigestAlgorithm(), pki.key(Entity.SIGNER_RSA), random)));
     }
 
     private byte[] extend(byte[] pdf, SignatureLevel level) {

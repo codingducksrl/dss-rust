@@ -124,6 +124,119 @@ class TlSnapshotTest {
         }
     }
 
+    /**
+     * A snapshot start leaves DSS's job with an empty cache. When the LOTL then cannot be downloaded, DSS keeps
+     * the snapshot's anchors but replaces the list summary with an empty one: published as is, every trusted
+     * chain would fail with an internal error. The refresh must keep the snapshot instead, and say so.
+     */
+    @Test
+    void failedRefreshAfterASnapshotStartKeepsTheSnapshot() {
+        TestEngines t = new TestEngines(tmp);
+        Path file = exportFrom(t, null);
+        try (DssEngine engine = t.engine(tmp.resolve("empty"), snapshot(file))) {
+            t.http.offline(true);
+            TrustedListManager.RefreshRecord rec = engine.refreshTrustedListsOnline();
+            assertFalse(rec.completed(), "nothing publishable came out of the refresh");
+            assertNotNull(rec.error());
+            assertTrue(rec.error().contains(SyntheticTrustedLists.LOTL_URL), rec.error());
+            assertEquals(3, rec.trustedCertificates());
+
+            Map<String, Object> status = engine.trustedListStatus();
+            assertEquals(Boolean.TRUE, status.get("loaded"));
+            assertEquals(3, status.get("trusted_certificates"));
+            assertNotNull(status.get("tl_snapshot"), "the snapshot provenance is kept");
+            assertEquals(2, TrustedListTest.list(status, "tls").size(), "and so is its list summary");
+            assertEquals(Boolean.FALSE, map(status, "last_online_refresh").get("completed"));
+            assertTrue(TrustedListTest.alertTypes(status).contains("refresh_not_published"));
+            // The whole point: validation still works, with the snapshot's trust.
+            assertEquals("TOTAL_PASSED/-", FixtureValidationTest.verdicts(
+                    engine.validate(Fixtures.read("pades/b-lta.pdf"), ValidationOptions.DEFAULT)).get(0));
+            // And what is exported is the consistent snapshot, with its original provenance.
+            Map<String, Object> exported = engine.exportTlSnapshot().info();
+            assertEquals("online", map(exported, "lists_loaded").get("mode"));
+            assertEquals(3, exported.get("trusted_certificates"));
+
+            // Once the network is back the refresh replaces the snapshot as usual.
+            t.http.offline(false);
+            assertTrue(engine.refreshTrustedListsOnline().completed());
+            Map<String, Object> after = engine.trustedListStatus();
+            assertNull(after.get("tl_snapshot"));
+            assertEquals(3, after.get("trusted_certificates"));
+            assertEquals("TOTAL_PASSED/-", FixtureValidationTest.verdicts(
+                    engine.validate(Fixtures.read("pades/b-lta.pdf"), ValidationOptions.DEFAULT)).get(0));
+        }
+    }
+
+    /** The LOTL downloads but no national list does: DSS would publish an empty pool; the snapshot is kept instead. */
+    @Test
+    void snapshotIsKeptWhenEveryNationalListFailsToDownload() {
+        TestEngines t = new TestEngines(tmp);
+        Path file = exportFrom(t, null);
+        try (DssEngine engine = t.engine(tmp.resolve("empty"), snapshot(file))) {
+            for (String url : List.of(SyntheticTrustedLists.IT_TL_URL, SyntheticTrustedLists.DE_TL_URL)) {
+                t.http.route(url, () -> {
+                    throw new eu.europa.esig.dss.spi.exception.DSSExternalResourceException("503 from " + url);
+                });
+            }
+            TrustedListManager.RefreshRecord rec = engine.refreshTrustedListsOnline();
+            assertFalse(rec.completed(), rec.toMap().toString());
+            assertTrue(rec.error().contains("2 of 2"), rec.error());
+            Map<String, Object> status = engine.trustedListStatus();
+            assertEquals(3, status.get("trusted_certificates"));
+            assertNotNull(status.get("tl_snapshot"));
+            assertEquals("TOTAL_PASSED/-", FixtureValidationTest.verdicts(
+                    engine.validate(Fixtures.read("pades/b-lta.pdf"), ValidationOptions.DEFAULT)).get(0));
+
+            // One list back: that is a partial result DSS can publish (the other list stays missing, as documented).
+            new SyntheticTrustedLists(t.pki, 2).serveOn(t.http);
+            t.http.route(SyntheticTrustedLists.DE_TL_URL, () -> {
+                throw new eu.europa.esig.dss.spi.exception.DSSExternalResourceException("still down");
+            });
+            assertTrue(engine.refreshTrustedListsOnline().completed());
+            assertEquals(2, engine.trustedListStatus().get("trusted_certificates"), "IT only");
+            assertNull(engine.trustedListStatus().get("tl_snapshot"));
+        }
+    }
+
+    /** A snapshot whose anchors point at lists its summary lacks would break every validation: refused up front. */
+    @Test
+    void snapshotWithAnchorsOutsideItsSummaryIsRejected() throws IOException {
+        TestEngines t = new TestEngines(tmp);
+        byte[] good = Files.readAllBytes(exportFrom(t, null));
+        TlSnapshotFile.Contents contents = TlSnapshotFile.contents(good);
+        TlSnapshotFile.Contents inconsistent = new TlSnapshotFile.Contents(contents.trustProperties(),
+                contents.trustTimes(), new eu.europa.esig.dss.model.tsl.TLValidationJobSummary(new java.util.ArrayList<>(List.of(
+                        new eu.europa.esig.dss.model.tsl.LOTLInfo(null, null, null, "https://other.dss-native.test/lotl.xml"))),
+                        new java.util.ArrayList<>()),
+                contents.alerts());
+        Map<String, Object> header = Json.parseObject(new String(header(good), StandardCharsets.UTF_8));
+        assertRejected(t, write("inconsistent", TlSnapshotFile.write(header, inconsistent)), "summary does not hold");
+    }
+
+    /** Read-only deployments: a snapshot start must not need a writable {@code cache_dir}. */
+    @Test
+    void snapshotStartDoesNotNeedAWritableCacheDirectory() throws IOException {
+        TestEngines t = new TestEngines(tmp);
+        Path file = exportFrom(t, null);
+        Path readOnly = Files.createDirectory(tmp.resolve("read-only"));
+        Path cache = readOnly.resolve("cache");
+        org.junit.jupiter.api.Assumptions.assumeTrue(readOnly.toFile().setWritable(false, false)
+                && !Files.isWritable(readOnly), "cannot make a directory read-only here");
+        try {
+            assertThrows(DssError.class, () -> t.engine(cache, null).close(), "without a snapshot the cache is needed");
+            try (DssEngine engine = t.engine(cache, snapshot(file))) {
+                assertEquals(3, engine.trustedListStatus().get("trusted_certificates"));
+                assertFalse(Files.exists(cache), "nothing was created");
+                // An online refresh still works; it just cannot store the lists.
+                assertTrue(engine.refreshTrustedListsOnline().completed());
+                assertEquals(3, engine.trustedListStatus().get("trusted_certificates"));
+                assertTrue(TrustedListTest.alertTypes(engine.trustedListStatus()).contains("cache_write_error"));
+            }
+        } finally {
+            readOnly.toFile().setWritable(true, false);
+        }
+    }
+
     @Test
     void exportNeedsLoadedLists() {
         TestEngines t = new TestEngines(tmp);
