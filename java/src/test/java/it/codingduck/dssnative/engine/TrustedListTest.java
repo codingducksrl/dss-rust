@@ -28,6 +28,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Stream;
 
 import org.junit.jupiter.api.Test;
@@ -531,7 +532,9 @@ class TrustedListTest {
         // the wait: close() says so, and the thread ends with the download.
         CountDownLatch entered = new CountDownLatch(1);
         CountDownLatch release = new CountDownLatch(1);
+        AtomicReference<Thread> downloader = new AtomicReference<>();
         t.http.beforeEachRequest(() -> {
+            downloader.set(Thread.currentThread());
             entered.countDown();
             boolean interrupted = false;
             while (release.getCount() > 0) {
@@ -555,6 +558,11 @@ class TrustedListTest {
             assertFalse(busy.threadsStopped(), "a thread was still inside the download");
             release.countDown();
             refresh.get(30, TimeUnit.SECONDS);
+            // The released thread is still interrupted and finishing its analysis: let it end before the next
+            // test starts, so nothing of this manager runs alongside that test's set-up.
+            Thread worker = downloader.get();
+            worker.join(TimeUnit.SECONDS.toMillis(10));
+            assertFalse(worker.isAlive(), "the trusted-list thread ended with the download");
         } finally {
             release.countDown();
             pool.shutdownNow();

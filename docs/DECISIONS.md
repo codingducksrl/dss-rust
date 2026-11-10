@@ -27,7 +27,9 @@ that older release only warns; CI refuses it.)
 macos-aarch64 and windows-x64. There is no macOS x64 or Windows arm64 build, and Native Image does not
 cross-compile. Windows was not selected. This sets the Phase 6 CI matrix:
 `ubuntu-24.04` (x64), `ubuntu-24.04-arm` and macOS runners: the library is built on `macos-15` and the packages
-are tested on `macos-14`, the oldest supported macOS.
+are tested there too. They were tested on `macos-14`, the oldest supported macOS, until GitHub retired that runner
+(2026-11): the macOS 14 floor is now held by the build (`-mmacosx-version-min`) and checked by `package.sh`
+(`otool -l`), not by running on it.
 
 ### Default trusted-list scope (asked; answered)
 
@@ -579,7 +581,7 @@ themselves:
 | Job | What |
 |---|---|
 | `build` | **linux-x64** (`ubuntu-24.04`), **linux-aarch64** (`ubuntu-24.04-arm`), **macos-aarch64** (`macos-15`). Full chain: JVM tests → native tests (exact metadata) → shared library → native tests again in `Exit` mode → C smoke → Rust fmt/clippy/tests → differential test → package |
-| `compat` | Each package on the oldest supported systems: AlmaLinux 9, Ubuntu 22.04, Fedora (zlib-ng) and macOS 14 |
+| `compat` | Each package on the oldest supported systems: AlmaLinux 9, Ubuntu 22.04 and macOS 15 (oldest hosted runner) |
 | `docker` | The image built from the linux-x64 package, its HEALTHCHECK and the package checks inside |
 | `online` (tag, or by hand with `online=true`) | linux-x64: JVM `-Pintegration`, `smoke-test-c.sh --online`, `test-rust.sh --online`, and the **seed TL cache** (full LOTL via `dss-cli tl refresh`, tarred `tl/` + status JSON; not a trusted-list snapshot file) |
 | `release-assets` (tag) | Creates the release as a draft, uploads every platform package, the seed cache, the OJ keystore, the source archives and `SHA256SUMS`, then publishes it (only `GITHUB_TOKEN`, no third-party action but the provenance attestation) |
@@ -713,7 +715,7 @@ The linux-aarch64 package ran in bare `ubuntu:24.04` (glibc 2.39) and `almalinux
 containers: no Java, `--network none`, `DISPLAY=:0`, `LANG=it_IT.UTF-8`. It ran `dss-cli version` and three
 validations with the same verdicts as plain DSS: PAdES LTA passed; CAdES B indeterminate, as expected without
 trusted lists or revocation data; tampered PAdES failed with `HASH_FAILURE`. Since 2026-11-09 CI's compat job
-runs every package on macOS 14, AlmaLinux 9, Ubuntu 22.04 and Fedora before a release.
+runs every package on macOS 15, AlmaLinux 9 and Ubuntu 22.04 before a release.
 
 ### `dss-cli` into a closed pipe
 
@@ -1034,7 +1036,9 @@ the signer only sees a digest. The logic is in `ExternalSigning`.
   on the same zlib implementation. A pure-Java deflate for the image alone would not help (PDFBox compresses the
   ICC, content and font streams the same way) and would invalidate the committed signing fixtures; the
   requirement is documented instead (README.md), `complete` detects a mismatch as `SIGNING_FAILED` before
-  anything is written, and CI's compat job replays the recorded fixtures on Fedora (zlib-ng).
+  anything is written. CI's compat job replayed the recorded fixtures on Fedora (zlib-ng) until 2026-11-10, where
+  the visible ones failed by this very limitation; Fedora is not a target, so that job was dropped instead of
+  linking a pinned static zlib into the library.
 - **Not done.** Preview rendering (DSS's `previewPageWithVisualSignature` needs AWT), creating a named new
   field, CMYK JPEGs, interlaced PNGs, colour profiles inside images (taken as sRGB), applying Exif orientation
   (refused instead), automatic flattening of transparency for PDF/A-1, and right-to-left or complex-script text
@@ -1481,7 +1485,7 @@ Replaces Phase 6's "CI runs only when a GitHub release is published". The releas
 (`.github/workflows/ci.yml`) runs on a pushed `v<semver>` tag or by hand, no longer on `release: published`: a
 published release was public before any test ran and stayed without assets when a job (often the live-LOTL one)
 failed. The workflow creates the GitHub release itself, as a draft, only after `build` (3 platforms), `compat`
-(each package on AlmaLinux 9, Ubuntu 22.04, Fedora with zlib-ng, macOS 14: version, validation, all recorded
+(each package on AlmaLinux 9, Ubuntu 22.04, macOS 15: version, validation, all recorded
 external signatures), `docker` (image build, HEALTHCHECK and package checks inside) and `online` (with the seed
 cache gated by `scripts/ci/check-tl-status.py`: every list downloaded, `TOTAL_PASSED`, current, used for trust) all
 passed; it uploads the assets and then publishes it. A release created by hand first is still filled

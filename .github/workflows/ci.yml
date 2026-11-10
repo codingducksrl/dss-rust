@@ -8,11 +8,12 @@
 # beyond the plan's allowance, macOS counting 10x.
 #
 #   tag v1.2.3 pushed   linux-x64, linux-aarch64, macos-aarch64: JVM + native + C + Rust + differential tests,
-#                       package; the packages on the oldest supported systems (glibc 2.34, Ubuntu 22.04, macOS 14)
-#                       and on a zlib-ng distribution; the Docker image; online suites against the real EU LOTL and
-#                       the seed trusted-list cache. Only when every job passed is the GitHub release v1.2.3
-#                       created, with the packages, the seed cache, the OJ keystore, the corresponding sources,
-#                       SHA256SUMS and (public repository) build provenance, and published.
+#                       package; the packages on the oldest supported systems (glibc 2.34, Ubuntu 22.04;
+#                       macOS 15, the oldest hosted runner); the Docker image;
+#                       online suites against the real EU LOTL and the seed trusted-list cache. Only when every
+#                       job passed is the GitHub release v1.2.3 created, with the packages, the seed cache, the OJ
+#                       keystore, the corresponding sources, SHA256SUMS and (public repository) build provenance,
+#                       and published.
 #   manual run          the same builds and tests, publishing nothing; online=true adds the online suites
 #
 # The tag is the version (v1.2.3 -> 1.2.3): the building jobs stamp it into java/pom.xml, rust/Cargo.toml and
@@ -159,10 +160,12 @@ jobs:
           if-no-files-found: ignore
 
   # The packages as users run them: on the oldest systems README.md promises (glibc 2.34 = AlmaLinux 9,
-  # Ubuntu 22.04, macOS 14), on a distribution whose zlib is zlib-ng (Fedora), without Java or network, under an
-  # Italian locale. Besides loading and validating, every recorded external signature must complete: that needs
-  # the digest the JVM computed when recording, so a different deflate output (zlib-ng) or a different native
-  # drawing of a visible signature fails here instead of as SIGNING_FAILED in production.
+  # Ubuntu 22.04), on macOS 15 (GitHub retired its macos-14 runners; package.sh still fails a library whose
+  # minos is above macOS 14), without Java or network, under an Italian locale. Besides loading and validating,
+  # every recorded external signature must complete: that needs the digest the JVM computed when recording, so a
+  # different native drawing of a visible signature fails here instead of as SIGNING_FAILED in production. No
+  # zlib-ng distribution (Fedora 40+, RHEL 10): there visible signatures deflate to other bytes than the
+  # recordings, a documented limitation (DECISIONS.md, "Same zlib on both hosts"), and Fedora is not a target.
   compat:
     name: ${{ matrix.platform }} on ${{ matrix.system }}
     needs: [plan, build]
@@ -172,11 +175,9 @@ jobs:
         include:
           - { platform: linux-x64, runner: ubuntu-24.04, system: almalinux-9, image: "almalinux:9@sha256:245f8aab832fe800aa42bdab5fad75ebbd8e0b4c9f24820a83c638b177857ae2" }
           - { platform: linux-x64, runner: ubuntu-24.04, system: ubuntu-22.04, image: "ubuntu:22.04@sha256:076e7bf82319619f28dd0aa9c02ab34b055ad37100395b4f49a2ffba04fb5e11" }
-          - { platform: linux-x64, runner: ubuntu-24.04, system: fedora-44-zlib-ng, image: "fedora:44@sha256:15da97ed9aa94dd3d92c3925eb89520f6c80e07ea7ee24cba848d1f8b6912b3e" }
           - { platform: linux-aarch64, runner: ubuntu-24.04-arm, system: almalinux-9, image: "almalinux:9@sha256:245f8aab832fe800aa42bdab5fad75ebbd8e0b4c9f24820a83c638b177857ae2" }
           - { platform: linux-aarch64, runner: ubuntu-24.04-arm, system: ubuntu-22.04, image: "ubuntu:22.04@sha256:076e7bf82319619f28dd0aa9c02ab34b055ad37100395b4f49a2ffba04fb5e11" }
-          - { platform: linux-aarch64, runner: ubuntu-24.04-arm, system: fedora-44-zlib-ng, image: "fedora:44@sha256:15da97ed9aa94dd3d92c3925eb89520f6c80e07ea7ee24cba848d1f8b6912b3e" }
-          - { platform: macos-aarch64, runner: macos-14, system: macos-14, image: "" }
+          - { platform: macos-aarch64, runner: macos-15, system: macos-15, image: "" }
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 20
     steps:
@@ -199,9 +200,6 @@ jobs:
           tar -xzf "$tarball" -C pkg
           dir="$(basename "$tarball" .tar.gz)"
           if [[ -n "$IMAGE" ]]; then
-            if [[ "$IMAGE" == fedora:* ]]; then
-              docker run --rm "$IMAGE" sh -c 'rpm -q zlib-ng-compat' # the point of this system
-            fi
             docker run --rm --network none -e LANG=it_IT.UTF-8 -e TZ=Europe/Rome -v "$PWD:/src:ro" -w /src "$IMAGE" \
               bash scripts/ci/package-smoke.sh "/src/pkg/$dir" /src/testdata/fixtures "$VERSION"
           else

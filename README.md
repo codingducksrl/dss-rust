@@ -338,11 +338,12 @@ curl -F document=@contract.pdf.p7m http://127.0.0.1:8484/validate
 
 It runs when a version tag is pushed (`git tag v1.2.0 && git push origin v1.2.0`), on all three platforms, or by
 hand with `gh workflow run ci.yml` (add `-f online=true` for the online suites and the seed cache). Besides the
-chain above it runs each package on the oldest supported systems (AlmaLinux 9 = glibc 2.34, Ubuntu 22.04,
-macOS 14) and on Fedora (zlib-ng), builds the Docker image and waits for its health check. Only when every job
-passed does it create the GitHub release for the tag (as a draft, filled, then published) with the packages, the
-seed cache, the OJ keystore, the source archives (dss-native, DSS, GraalVM CE, labs-openjdk), `SHA256SUMS` and,
-once the repository is public, signed build provenance. The tag is the version: `v1.2.0` (or `v1.2.0-rc.1`)
+chain above it runs each package on the oldest supported systems (AlmaLinux 9 = glibc 2.34, Ubuntu 22.04)
+and on macOS 15 (the oldest GitHub-hosted runner), builds the Docker image and waits for its health check.
+Only when every job passed does it create the GitHub release for the tag (as a draft, filled, then published)
+with the packages, the seed cache, the OJ keystore, the source archives (dss-native, DSS, GraalVM CE,
+labs-openjdk), `SHA256SUMS` and, once the repository is public, signed build provenance.
+The tag is the version: `v1.2.0` (or `v1.2.0-rc.1`)
 builds 1.2.0 everywhere, from the library to the package names. The repository itself carries only the
 placeholder `0.0.0-dev`, which local and non-release builds report.
 

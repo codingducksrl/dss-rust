@@ -47,10 +47,12 @@ precedence = "aggregate"
 SPDX-FileCopyrightText = "2026 Coding Duck"
 SPDX-License-Identifier = "LGPL-2.1-or-later"
 
-# The audit report and its post-remediation status view: generated HTML, no header of their own.
+# The audit report and its post-remediation status view: generated HTML, no header of their own. `override`, so
+# that reuse does not read them: they quote the SPDX headers of the files they cite, which `aggregate` would parse
+# as their own (invalid) licence expressions.
 [[annotations]]
 path = ["audit.html", "audit-2.html"]
-precedence = "aggregate"
+precedence = "override"
 SPDX-FileCopyrightText = "2026 Coding Duck"
 SPDX-License-Identifier = "LGPL-2.1-or-later"
 

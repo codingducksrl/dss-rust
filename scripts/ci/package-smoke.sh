@@ -12,11 +12,12 @@
 #    a tampered PAdES fails with HASH_FAILURE.
 # 3. Every recorded external signature in <fixtures_dir>/signing/ completes (`dss-cli sign complete`). Completing
 #    needs the same digest the JVM computed when the fixture was recorded, so this also proves that this
-#    machine's zlib (zlib-ng on Fedora, for instance) and the native drawing of visible signatures produce the
-#    same bytes.
+#    machine's zlib and the native drawing of visible signatures produce the same bytes. On a zlib-ng
+#    distribution (Fedora 40+) the visible ones do not, a documented limitation (README.md, visible signatures).
 #
-# CI runs it on the oldest supported systems (almalinux:9 = glibc 2.34, ubuntu:22.04, macOS 14) and on a zlib-ng
-# distribution before a release is published. Needs only bash and the package: no Java, no network.
+# CI runs it on the oldest supported systems (almalinux:9 = glibc 2.34, ubuntu:22.04) and on macOS 15 (the
+# oldest hosted runner; the macOS 14 floor is checked by package.sh) before a release is published. Needs only
+# bash and the package: no Java, no network.
 set -euo pipefail
 pkg="$(cd "${1:?usage: package-smoke.sh <package_dir> <fixtures_dir> [version]}" && pwd)"
 fx="$(cd "${2:?usage: package-smoke.sh <package_dir> <fixtures_dir> [version]}" && pwd)"

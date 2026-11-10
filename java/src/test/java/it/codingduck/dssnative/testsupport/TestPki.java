@@ -30,6 +30,7 @@ import java.util.Base64;
 import java.util.Date;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 
 import org.bouncycastle.asn1.ASN1ObjectIdentifier;
 import org.bouncycastle.asn1.DEROctetString;
@@ -126,7 +127,18 @@ public final class TestPki {
         }
     }
 
+    /**
+     * The committed PKI, loaded once per JVM. {@link #load()} is called by every {@link TestEngines}, and test
+     * threads (a CRL served by {@link #freshCrl} on a trusted-list thread, a TSA answering on a validation thread)
+     * call into it while the next test's main thread already does. A {@link KeyStore} is not thread-safe, and each
+     * {@code getKey} decrypts the PKCS#12 entry anew (PBKDF2 + AES): sharing one instance that decrypts every key
+     * exactly once keeps the keystore off the hot path entirely.
+     */
+    private static volatile TestPki committed;
+
     private final KeyStore store;
+    private final Map<Entity, PrivateKey> keys = new ConcurrentHashMap<>();
+    private final Map<Entity, X509Certificate> certificates = new ConcurrentHashMap<>();
 
     private TestPki(KeyStore store) {
         this.store = store;
@@ -136,14 +148,26 @@ public final class TestPki {
         return Fixtures.dir().resolve("pki/test-pki.p12");
     }
 
+    /** The committed PKI at {@link #defaultLocation()}: one shared, immutable instance per JVM. */
     public static TestPki load() {
-        return load(defaultLocation());
+        TestPki pki = committed;
+        if (pki == null) {
+            synchronized (TestPki.class) {
+                pki = committed;
+                if (pki == null) {
+                    pki = load(defaultLocation());
+                    committed = pki;
+                }
+            }
+        }
+        return pki;
     }
 
+    /** Loads a PKI written by {@link #generate}; a new instance on every call. */
     public static TestPki load(Path p12) {
         try (InputStream in = Files.newInputStream(p12)) {
             KeyStore ks = KeyStore.getInstance("PKCS12");
-            ks.load(in, PASSWORD);
+            ks.load(in, password());
             return new TestPki(ks);
         } catch (IOException | GeneralSecurityException e) {
             throw new IllegalStateException("cannot load test PKI " + p12
@@ -151,24 +175,38 @@ public final class TestPki {
         }
     }
 
+    /** A private copy of {@link #PASSWORD} for the JCA, which may clear the array it is given. */
+    private static char[] password() {
+        return PASSWORD.clone();
+    }
+
     public X509Certificate x509(Entity e) {
-        try {
-            return (X509Certificate) store.getCertificate(e.alias);
-        } catch (GeneralSecurityException ex) {
-            throw new IllegalStateException(ex);
-        }
+        return certificates.computeIfAbsent(e, entity -> {
+            try {
+                synchronized (store) {
+                    return (X509Certificate) store.getCertificate(entity.alias);
+                }
+            } catch (GeneralSecurityException ex) {
+                throw new IllegalStateException(ex);
+            }
+        });
     }
 
     public CertificateToken token(Entity e) {
         return new CertificateToken(x509(e));
     }
 
+    /** The entity's private key, decrypted from the PKCS#12 entry on first use and cached. */
     public PrivateKey key(Entity e) {
-        try {
-            return (PrivateKey) store.getKey(e.alias, PASSWORD);
-        } catch (GeneralSecurityException ex) {
-            throw new IllegalStateException(ex);
-        }
+        return keys.computeIfAbsent(e, entity -> {
+            try {
+                synchronized (store) {
+                    return (PrivateKey) store.getKey(entity.alias, password());
+                }
+            } catch (GeneralSecurityException ex) {
+                throw new IllegalStateException(ex);
+            }
+        });
     }
 
     /** Chain from the entity up to (and including) the root, for entities issued by the root. */
@@ -399,7 +437,7 @@ public final class TestPki {
 
             Files.createDirectories(p12.getParent());
             try (OutputStream out = Files.newOutputStream(p12)) {
-                ks.store(out, PASSWORD);
+                ks.store(out, password());
             }
             return new TestPki(ks);
         } catch (IOException | GeneralSecurityException | org.bouncycastle.operator.OperatorCreationException e) {
@@ -448,7 +486,7 @@ public final class TestPki {
                     key(Entity.ROOT_CA), now.minus(1, ChronoUnit.DAYS), now.plus(30, ChronoUnit.DAYS), Profile.TLS_SERVER);
             KeyStore ks = KeyStore.getInstance("PKCS12");
             ks.load(null, null);
-            ks.setKeyEntry("tls", kp.getPrivate(), PASSWORD, new Certificate[] {cert, x509(Entity.ROOT_CA)});
+            ks.setKeyEntry("tls", kp.getPrivate(), password(), new Certificate[] {cert, x509(Entity.ROOT_CA)});
             return ks;
         } catch (IOException | GeneralSecurityException | org.bouncycastle.operator.OperatorCreationException e) {
             throw new IllegalStateException(e);
@@ -486,7 +524,7 @@ public final class TestPki {
     }
 
     private static void put(KeyStore ks, Entity e, PrivateKey key, X509Certificate... chain) throws GeneralSecurityException {
-        ks.setKeyEntry(e.alias, key, PASSWORD, (Certificate[]) chain);
+        ks.setKeyEntry(e.alias, key, password(), (Certificate[]) chain);
     }
 
     /**
