@@ -140,3 +140,9 @@ released yet; the first tag will move "Unreleased" under its version.
   requires `guzzlehttp/psr7` ^2.0 (with `guzzlehttp/guzzle` ^7.2).
 - Releases are created by pushing a `v<semver>` tag, after every gate passed; repackaging the same built library
   gives byte-identical tarballs.
+
+### Fixed
+
+- OCSP requests carry a 16-byte nonce instead of DSS's default 32 bytes. ArubaPEC's responders answer a nonce over
+  30 bytes with `unauthorized`, so since the nonce was added every ArubaPEC certificate fell back to its CRL (about
+  9 MB): slower validation, and LT/LTA extensions and signatures embedding the CRL instead of an OCSP response.

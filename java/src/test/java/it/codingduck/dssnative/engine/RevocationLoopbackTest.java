@@ -33,8 +33,11 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import org.bouncycastle.asn1.ASN1OctetString;
 import org.bouncycastle.asn1.ocsp.OCSPObjectIdentifiers;
+import org.bouncycastle.asn1.x509.Extension;
 import org.bouncycastle.cert.ocsp.OCSPReq;
+import org.bouncycastle.cert.ocsp.OCSPRespBuilder;
 
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
@@ -107,13 +110,21 @@ class RevocationLoopbackTest {
         route("/root-ca.cer", body -> encoded(root));
         route("/intermediate.cer", body -> encoded(intermediate.cert()));
         route("/ocsp", body -> {
+            Extension nonce;
             try {
-                ocspRequestHadNonce = new OCSPReq(body).getExtension(OCSPObjectIdentifiers.id_pkix_ocsp_nonce) != null;
+                nonce = new OCSPReq(body).getExtension(OCSPObjectIdentifiers.id_pkix_ocsp_nonce);
             } catch (IOException e) {
                 throw new UncheckedIOException(e);
             }
-            return ocspFailing ? TestPki.ocspInternalError()
-                    : TestPki.ocspResponse(body, intermediate.cert(), intermediate.key(), revokedOnOcsp, ocspNonce);
+            ocspRequestHadNonce = nonce != null;
+            if (ocspFailing) {
+                return TestPki.ocspError(OCSPRespBuilder.INTERNAL_ERROR);
+            }
+            // As ArubaPEC's responders do: a nonce over 30 bytes is "unauthorized".
+            if (nonce != null && ASN1OctetString.getInstance(nonce.getParsedValue()).getOctets().length > 30) {
+                return TestPki.ocspError(OCSPRespBuilder.UNAUTHORIZED);
+            }
+            return TestPki.ocspResponse(body, intermediate.cert(), intermediate.key(), revokedOnOcsp, ocspNonce);
         });
         route("/tsa", body -> TestPki.timestampResponse(body, tsa.key(), List.of(tsa.cert(), root)));
         server.createContext("/", exchange -> {

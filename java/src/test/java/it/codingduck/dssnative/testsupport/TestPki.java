@@ -318,10 +318,10 @@ public final class TestPki {
         }
     }
 
-    /** An OCSP error response ({@code internalError}), for a responder that is up but cannot answer. */
-    public static byte[] ocspInternalError() {
+    /** An OCSP error response, e.g. {@link OCSPRespBuilder#INTERNAL_ERROR} or {@link OCSPRespBuilder#UNAUTHORIZED}. */
+    public static byte[] ocspError(int status) {
         try {
-            return new OCSPRespBuilder().build(OCSPRespBuilder.INTERNAL_ERROR, null).getEncoded();
+            return new OCSPRespBuilder().build(status, null).getEncoded();
         } catch (IOException | OCSPException e) {
             throw new IllegalStateException(e);
         }

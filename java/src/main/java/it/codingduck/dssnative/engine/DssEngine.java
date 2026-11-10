@@ -708,7 +708,9 @@ public final class DssEngine implements AutoCloseable {
             ocsp.setDataLoader(ocspLoader);
             // A nonce binds each response to its request (a responder that ignores it only gets a warning), and
             // a response outside its thisUpdate/nextUpdate window is at least logged instead of passing silently.
-            ocsp.setNonceSource(new SecureRandomNonceSource());
+            // 16 bytes, not DSS's default 32: ArubaPEC's responders answer a nonce over 30 bytes with
+            // "unauthorized", which sends every one of its certificates to the (multi-megabyte) CRL.
+            ocsp.setNonceSource(new SecureRandomNonceSource(16));
             ocsp.setAlertOnInvalidUpdateTime(new LogOnStatusAlert(Level.WARN));
             verifier.setOcspSource(ocsp);
         } else {

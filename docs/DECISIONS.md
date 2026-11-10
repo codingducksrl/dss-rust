@@ -144,7 +144,9 @@ API names were checked against the DSS 6.5.1 sources (cookbook `TLValidationJobS
   appear under `nested`. `unwrap_nested: false` disables this. DSS itself validates only the outer envelope.
 - **Revocation:** `revocation: "online"` (default) uses `OnlineCRLSource` / `OnlineOCSPSource` (with DSS's
   `OCSPDataLoader` for the OCSP content type) and AIA fetching. `"offline"` uses only data embedded in the
-  signature. Since 2026-11-09: `OnlineOCSPSource` sends a nonce (`SecureRandomNonceSource`) and logs, at WARN,
+  signature. Since 2026-11-09: `OnlineOCSPSource` sends a nonce (`SecureRandomNonceSource`, 16 bytes since 2026-11-10:
+  ArubaPEC's responders answer DSS's default 32 bytes, anything over 30, with `unauthorized`, and the CRL
+  fallback then costs a 9 MB download and embeds it in LT extensions) and logs, at WARN,
   responses outside their thisUpdate/nextUpdate window (not an exception: a responder or host clock skew must not
   turn validation into a failure, and the default policy ignores freshness). AIA fetches HTTP(S) only. A
   `SignaturePolicyProvider` without a data loader is set explicitly, so a document-named policy URL is never
